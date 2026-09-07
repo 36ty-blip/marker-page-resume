@@ -1,0 +1,68 @@
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+from pypdf import PdfReader, PdfWriter
+
+from page_controller import process
+
+
+class PageControllerTest(unittest.TestCase):
+    def test_processes_each_page_once_and_resumes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "sample.pdf"
+            writer = PdfWriter()
+            writer.add_blank_page(width=100, height=100)
+            writer.add_blank_page(width=100, height=100)
+            with source.open("wb") as output:
+                writer.write(output)
+
+            calls = root / "calls.txt"
+            fake_marker = root / "fake_marker.py"
+            fake_marker.write_text(
+                """import argparse
+from pathlib import Path
+from pypdf import PdfReader
+
+parser = argparse.ArgumentParser()
+parser.add_argument('source', type=Path)
+parser.add_argument('--output_dir', type=Path, required=True)
+parser.add_argument('--output_format')
+args = parser.parse_args()
+number = args.source.stem.split('-')[-1]
+args.output_dir.mkdir(parents=True, exist_ok=True)
+(args.output_dir / 'page.md').write_text(f'Page {number}\\n', encoding='utf-8')
+with Path(r'CALLS_FILE').open('a', encoding='utf-8') as log:
+    log.write(number + '\\n')
+assert len(PdfReader(str(args.source)).pages) == 1
+""".replace("CALLS_FILE", str(calls).replace("\\", "\\\\")),
+                encoding="utf-8",
+            )
+
+            marker = str(root / "fake_marker.cmd") if sys.platform == "win32" else str(fake_marker)
+            marker_args = []
+            if sys.platform == "win32":
+                Path(marker).write_text(
+                    f'@"{sys.executable}" "{fake_marker}" %*\n', encoding="utf-8"
+                )
+            else:
+                fake_marker.write_text(
+                    f"#!{sys.executable}\n" + fake_marker.read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+                fake_marker.chmod(0o755)
+
+            output_dir = root / "output"
+            final = process(source, output_dir, marker, marker_args)
+            self.assertEqual(len(PdfReader(str(source)).pages), 2)
+            self.assertIn("Page 0001", final.read_text(encoding="utf-8"))
+            self.assertIn("Page 0002", final.read_text(encoding="utf-8"))
+            process(source, output_dir, marker, marker_args)
+            self.assertEqual(calls.read_text(encoding="utf-8").splitlines(), ["0001", "0002"])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
