@@ -18,7 +18,26 @@ Install Marker separately, then install the controller’s only dependency:
 python -m pip install pypdf
 ```
 
-## Run
+## Windows-friendly graphical launcher
+
+Run the script without arguments:
+
+```console
+python page_controller.py
+```
+
+The pop-up window lets you select:
+
+- one input PDF or a folder of PDFs;
+- the output folder;
+- the `marker_single` executable;
+- Marker 1.10 or Marker 2;
+- low-memory Marker 1 batch sizes;
+- any additional Marker options.
+
+Choose **Start / Resume** to begin. Choose **Pause** at any time to stop the active page worker safely. Starting again skips every completed page and reruns only the interrupted page.
+
+## Command-line use
 
 Marker 2 example:
 
