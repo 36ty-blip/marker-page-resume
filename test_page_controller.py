@@ -5,10 +5,28 @@ from pathlib import Path
 
 from pypdf import PdfReader, PdfWriter
 
-from page_controller import process
+from page_controller import find_sources, marker_args_for, process
 
 
 class PageControllerTest(unittest.TestCase):
+    def test_folder_discovery_and_gui_presets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "B.PDF").touch()
+            (root / "a.pdf").touch()
+            (root / "ignore.txt").touch()
+            self.assertEqual(
+                [path.name for path in find_sources(root)], ["a.pdf", "B.PDF"]
+            )
+        self.assertEqual(
+            marker_args_for("Marker 2", False, "--foo bar"),
+            ["--mode", "balanced", "--foo", "bar"],
+        )
+        self.assertIn(
+            "--recognition_batch_size",
+            marker_args_for("Marker 1.10", True, ""),
+        )
+
     def test_processes_each_page_once_and_resumes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
