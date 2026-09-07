@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -24,6 +25,12 @@ IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 
 class Paused(Exception):
     """Raised after a requested pause has stopped the active page worker."""
+
+
+@dataclass(frozen=True)
+class ProcessResult:
+    final: Path
+    failed_pages: tuple[int, ...]
 
 
 def source_id(path: Path) -> str:
@@ -61,6 +68,22 @@ def completed_markdown(page_dir: Path) -> Path | None:
     except ValueError:
         return None
     return markdown if markdown.is_file() and markdown.stat().st_size else None
+
+
+def recover_saved_markdown(page_dir: Path) -> Path | None:
+    """Recover output saved after Marker finished but before checkpoint creation."""
+    candidates = sorted(
+        (path for path in (page_dir / "runs").rglob("*.md") if path.stat().st_size),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    if not candidates:
+        return None
+    markdown = candidates[0]
+    pending = page_dir / "complete.tmp"
+    pending.write_text(os.path.relpath(markdown, page_dir), encoding="utf-8")
+    pending.replace(page_dir / "complete.txt")
+    return markdown
 
 
 def stop_process(process: subprocess.Popen) -> None:
@@ -102,6 +125,9 @@ def convert_page(
     existing = completed_markdown(page_dir)
     if existing:
         return existing
+    recovered = recover_saved_markdown(page_dir)
+    if recovered:
+        return recovered
 
     run_dir = page_dir / "runs" / str(time.time_ns())
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -126,20 +152,40 @@ def convert_page(
     return markdown
 
 
-def make_image_paths_portable(markdown: Path, output_dir: Path) -> str:
-    text = markdown.read_text(encoding="utf-8").strip()
+def assemble_markdown(markdowns: list[Path | None], final: Path) -> None:
+    """Create the final Markdown and copy its images out of temporary storage."""
+    image_dir = final.parent / "images"
+    copied: dict[Path, Path] = {}
+    chunks = []
 
-    def rewrite(match: re.Match[str]) -> str:
-        alt, target = match.groups()
-        if "://" in target or target.startswith("#"):
-            return match.group(0)
-        image = (markdown.parent / target).resolve()
-        if not image.exists():
-            return match.group(0)
-        relative = Path(os.path.relpath(image, output_dir)).as_posix()
-        return f"![{alt}]({relative})"
+    for number, markdown in enumerate(markdowns, 1):
+        if markdown is None:
+            chunks.append(f"<!-- Page {number} failed and remains pending. -->")
+            continue
+        text = markdown.read_text(encoding="utf-8").strip()
 
-    return IMAGE_RE.sub(rewrite, text)
+        def rewrite(match: re.Match[str]) -> str:
+            alt, target = match.groups()
+            if "://" in target or target.startswith("#"):
+                return match.group(0)
+            image = (markdown.parent / target).resolve()
+            if not image.is_file():
+                return match.group(0)
+            if image not in copied:
+                image_dir.mkdir(parents=True, exist_ok=True)
+                destination = image_dir / (
+                    f"{final.stem}_{len(copied) + 1:03}{image.suffix.lower()}"
+                )
+                shutil.copy2(image, destination)
+                copied[image] = destination
+            relative = copied[image].relative_to(final.parent).as_posix()
+            return f"![{alt}]({relative})"
+
+        chunks.append(IMAGE_RE.sub(rewrite, text))
+
+    pending = final.with_suffix(".md.tmp")
+    pending.write_text("\n\n".join(chunks).strip() + "\n", encoding="utf-8")
+    pending.replace(final)
 
 
 def process(
@@ -149,30 +195,42 @@ def process(
     marker_args: list[str],
     stop_event: threading.Event | None = None,
     status: Callable[[str], None] = print,
-) -> Path:
+    keep_intermediate_files: bool = False,
+) -> ProcessResult:
     source = source.resolve()
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     work_dir = output_dir / "_marker_pages" / f"{source.stem}-{source_id(source)}"
     pages = split_pdf(source, work_dir / "input")
 
-    results = []
+    results: list[Path | None] = []
+    failed_pages = []
     for number, page in enumerate(pages, 1):
         if stop_event is not None and stop_event.is_set():
             raise Paused
         page_dir = work_dir / f"page-{number:04}"
         state = "skipping completed" if completed_markdown(page_dir) else "processing"
         status(f"[{number}/{len(pages)}] {state}")
-        results.append(
-            convert_page(page, page_dir, marker, marker_args, stop_event)
-        )
+        try:
+            results.append(
+                convert_page(page, page_dir, marker, marker_args, stop_event)
+            )
+        except (subprocess.CalledProcessError, RuntimeError) as exc:
+            failed_pages.append(number)
+            results.append(None)
+            status(f"[{number}/{len(pages)}] failed: {exc}")
 
     final = output_dir / f"{source.stem}.md"
-    pending = final.with_suffix(".md.tmp")
-    chunks = [make_image_paths_portable(path, output_dir) for path in results]
-    pending.write_text("\n\n".join(chunks).strip() + "\n", encoding="utf-8")
-    pending.replace(final)
-    return final
+    assemble_markdown(results, final)
+    if failed_pages:
+        status("Pending pages: " + ", ".join(map(str, failed_pages)))
+    elif not keep_intermediate_files:
+        shutil.rmtree(work_dir)
+        try:
+            work_dir.parent.rmdir()
+        except OSError:
+            pass
+    return ProcessResult(final, tuple(failed_pages))
 
 
 def find_sources(path: Path) -> list[Path]:
@@ -218,6 +276,7 @@ def run_gui() -> int:
     marker_var = tk.StringVar(value="marker_single")
     version_var = tk.StringVar(value="Marker 2")
     low_memory_var = tk.BooleanVar(value=True)
+    keep_intermediate_var = tk.BooleanVar(value=False)
     extra_var = tk.StringVar()
     status_var = tk.StringVar(value="Ready")
     events: queue.SimpleQueue[tuple[str, str]] = queue.SimpleQueue()
@@ -262,12 +321,14 @@ def run_gui() -> int:
         pause_button.configure(state="normal" if running else "disabled")
 
     def work(
-        sources: list[Path], output: Path, marker: str, marker_args: list[str]
+        sources: list[Path], output: Path, marker: str, marker_args: list[str],
+        keep_intermediate_files: bool,
     ) -> None:
         try:
+            incomplete = []
             for source in sources:
                 events.put(("status", f"{source.name}: starting"))
-                final = process(
+                result = process(
                     source,
                     output,
                     marker,
@@ -276,9 +337,15 @@ def run_gui() -> int:
                     lambda message, name=source.name: events.put(
                         ("status", f"{name}: {message}")
                     ),
+                    keep_intermediate_files,
                 )
-                events.put(("status", f"Created: {final.name}"))
-            events.put(("done", f"Completed {len(sources)} PDF(s)."))
+                if result.failed_pages:
+                    incomplete.append(source.name)
+                events.put(("status", f"Created: {result.final.name}"))
+            message = f"Completed {len(sources)} PDF(s)."
+            if incomplete:
+                message += " Incomplete: " + ", ".join(incomplete)
+            events.put(("done", message))
         except Paused:
             events.put(("paused", "Paused. Press Start to resume."))
         except Exception as exc:
@@ -306,7 +373,8 @@ def run_gui() -> int:
         set_running(True)
         status_var.set("Starting…")
         worker = threading.Thread(
-            target=work, args=(sources, output, marker, marker_args)
+            target=work,
+            args=(sources, output, marker, marker_args, keep_intermediate_var.get()),
         )
         worker.start()
 
@@ -378,14 +446,20 @@ def run_gui() -> int:
         row=4, column=1, columnspan=4, sticky="ew", padx=8, pady=5
     )
 
-    ttk.Separator(frame).grid(row=5, column=0, columnspan=5, sticky="ew", pady=8)
+    ttk.Checkbutton(
+        frame,
+        text="Keep intermediate files after success",
+        variable=keep_intermediate_var,
+    ).grid(row=5, column=1, columnspan=4, sticky="w", padx=8, pady=5)
+
+    ttk.Separator(frame).grid(row=6, column=0, columnspan=5, sticky="ew", pady=8)
     ttk.Label(frame, textvariable=status_var, width=72).grid(
-        row=6, column=0, columnspan=3, sticky="w"
+        row=7, column=0, columnspan=3, sticky="w"
     )
     pause_button = ttk.Button(frame, text="Pause", command=pause, state="disabled")
-    pause_button.grid(row=6, column=3, padx=(8, 5))
+    pause_button.grid(row=7, column=3, padx=(8, 5))
     start_button = ttk.Button(frame, text="Start / Resume", command=start)
-    start_button.grid(row=6, column=4)
+    start_button.grid(row=7, column=4)
 
     version_var.trace_add("write", update_version)
     update_version()
@@ -406,6 +480,11 @@ def main() -> int:
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--marker", required=True, help="path to marker_single")
     parser.add_argument(
+        "--keep-intermediate-files",
+        action="store_true",
+        help="retain split pages, raw Marker output, and checkpoints after success",
+    )
+    parser.add_argument(
         "marker_args",
         nargs=argparse.REMAINDER,
         help="Marker options after a standalone -- separator",
@@ -415,9 +494,22 @@ def main() -> int:
 
     try:
         sources = find_sources(args.source)
+        incomplete = []
         for source in sources:
-            final = process(source, args.output_dir, args.marker, marker_args)
-            print(f"Created: {final}")
+            result = process(
+                source,
+                args.output_dir,
+                args.marker,
+                marker_args,
+                keep_intermediate_files=args.keep_intermediate_files,
+            )
+            print(f"Created: {result.final}")
+            if result.failed_pages:
+                incomplete.append((source, result.failed_pages))
+        if incomplete:
+            for source, pages in incomplete:
+                print(f"Incomplete: {source.name}; pending pages: {', '.join(map(str, pages))}")
+            return 1
     except ValueError as exc:
         parser.error(str(exc))
     except (KeyboardInterrupt, Paused):
