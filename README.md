@@ -37,6 +37,22 @@ The pop-up window lets you select:
 
 Choose **Start / Resume** to begin. Choose **Pause** at any time to stop the active page worker safely. Starting again skips every completed page and reruns only the interrupted page.
 
+### Create a Windows desktop shortcut
+
+Use the same Python installation where you installed `pypdf`. Its windowless executable is normally `pythonw.exe`; inside a virtual environment it is under `.venv\Scripts\pythonw.exe`.
+
+1. Right-click the Windows desktop and choose **New → Shortcut**.
+2. Enter this as the shortcut location, replacing both example paths:
+
+   ```text
+   "C:\path\to\pythonw.exe" "C:\path\to\marker-page-resume\page_controller.py"
+   ```
+
+3. Choose **Next**, name it **Marker Page Resume**, and choose **Finish**.
+4. Double-click the shortcut whenever you want to open the graphical launcher directly, without a command window.
+
+Keep the quotation marks around both paths, especially when a folder name contains spaces. If you are unsure which Python installation is active, run `where pythonw` in Command Prompt.
+
 ## Command-line use
 
 Marker 2 example:
