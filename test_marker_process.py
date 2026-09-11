@@ -409,7 +409,7 @@ class MarkerProcessTests(unittest.TestCase):
 
             records = marker.list_active_runs()
             self.assertEqual(len(records), 1)
-            self.assertEqual(Path(records[0]["work_dir"]), legacy)
+            self.assertEqual(Path(records[0]["work_dir"]).resolve(), legacy.resolve())
             self.assertTrue(legacy.is_dir())
 
     def test_cli_without_arguments_prints_help(self):
@@ -467,7 +467,9 @@ class MarkerProcessTests(unittest.TestCase):
                 result = marker.main([str(source), "--dry-run"])
 
             self.assertEqual(result, 0)
-            self.assertIn(str(source.parent / "marker_output"), stdout.getvalue())
+            self.assertIn(
+                str((source.parent / "marker_output").resolve()), stdout.getvalue()
+            )
             check_runtime.assert_not_called()
 
     def test_cli_dry_run_with_restart_does_not_delete_outputs(self):
@@ -559,7 +561,9 @@ class MarkerProcessTests(unittest.TestCase):
                 result = marker.main([str(source), "--output", str(output)])
 
             self.assertEqual(result, 0)
-            self.assertEqual(stdout.getvalue().strip(), str(output / "source.md"))
+            self.assertEqual(
+                stdout.getvalue().strip(), str((output / "source.md").resolve())
+            )
             self.assertIn("Summary: 1 succeeded", stderr.getvalue())
             self.assertEqual(process.call_args.args[2], "2.0")
 
