@@ -1,3 +1,25 @@
+.venv/
 __pycache__/
 *.py[cod]
+*.log
+*.jsonl
+*.pdf
 
+# Local conversion state and generated output
+.marker_last_run.json
+_marker_work/
+marker_output/
+*_output/
+images/
+tmp/
+
+# Development experiments and comparisons
+_compare_marker*/
+_ram_vram_check*/
+quality_compare/
+public_release/
+marker_pipeline.py
+marker_process_experiment.py
+test_marker_process_experiment.py
+run_marker1_experiment.cmd
+▶ marker --help.md

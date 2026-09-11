@@ -1,107 +1,148 @@
-# Resumable page processing for Marker 1 and Marker 2
+# Marker Controller
 
-Run each PDF page in a fresh Marker worker process, checkpoint completed pages, and resume after an interruption without repeating finished work.
+A Windows-friendly controller for converting PDFs and supported documents to
+Markdown with Marker. It adds resumable page checkpoints, low-VRAM execution,
+multiple inputs, page selection, structured results, a desktop GUI, and a
+small offline interactive tutorial.
 
-This controller is **independent of Marker’s model architecture**. It works with Marker 1.x and the newer VLM-backed Marker 2. It does not require a GPU; Marker can use whichever backend is configured separately.
+Marker Controller does not upload documents or tutorial data. Conversion,
+checkpoints, and the tutorial run locally.
 
-## Why use it?
+## Features
 
-- Press `Ctrl+C` at any time. Completed pages remain checkpointed.
-- Resume with the same command. Only an interrupted or incomplete page is rerun.
-- Memory and failures are isolated to one page worker instead of accumulating in a long-lived document process.
-- If one page fails, the remaining pages still run and a clearly marked partial Markdown file is created.
-- Extracted images are copied into a stable `images` folder, so the final Markdown does not depend on temporary files.
+- Marker 1.10 and Marker 2 execution paths
+- Page-by-page or whole-document conversion
+- Safe interruption and per-document resume
+- Resume using saved settings or compatible new settings
+- Multiple files and folders, recursive discovery, and include/exclude filters
+- One-based page ranges such as `1-5,8,12-`
+- TTY-aware progress plus quiet, verbose, and debug modes
+- Diagnostic logs and JSON Lines results
+- Optional rich structural metadata and local Qwen refinement
+- Tk desktop GUI
+- Lightweight offline `--tutorial`
+
+## Requirements
+
+- Windows 10 or 11
+- Python 3.12 recommended
+- An NVIDIA GPU supported by the selected Marker runtime
+- [qpdf](https://qpdf.sourceforge.io/) for page-by-page processing
+- Marker and any optional llama.cpp/GGUF models installed locally
+
+The controller contains no model files or third-party executables.
 
 ## Install
 
-Install Marker separately, then install the controller’s only dependency:
-
-```console
-python -m pip install pypdf
+```powershell
+git clone https://github.com/36ty-blip/marker-controller.git
+cd marker-controller
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m pip install "marker-pdf==1.10.2"
 ```
 
-## Windows-friendly graphical launcher
+Run the controller from the repository:
 
-Run the script without arguments:
-
-```console
-python page_controller.py
+```powershell
+.\marker.cmd --check
+.\marker.cmd --tutorial
 ```
 
-The pop-up window lets you select:
+The default paths target the author's Windows layout. Override runtime paths
+without editing the source:
 
-- one input PDF or a folder of PDFs;
-- the output folder;
-- the `marker_single` executable;
-- Marker 1.10 or Marker 2;
-- low-memory Marker 1 batch sizes;
-- any additional Marker options.
-- whether to retain intermediate files after a successful conversion.
-
-Choose **Start / Resume** to begin. Choose **Pause** at any time to stop the active page worker safely. Starting again skips every completed page and reruns only the interrupted page.
-
-### Create a Windows desktop shortcut
-
-Use the same Python installation where you installed `pypdf`. Its windowless executable is normally `pythonw.exe`; inside a virtual environment it is under `.venv\Scripts\pythonw.exe`.
-
-1. Right-click the Windows desktop and choose **New → Shortcut**.
-2. Enter this as the shortcut location, replacing both example paths:
-
-   ```text
-   "C:\path\to\pythonw.exe" "C:\path\to\marker-page-resume\page_controller.py"
-   ```
-
-3. Choose **Next**, name it **Marker Page Resume**, and choose **Finish**.
-4. Double-click the shortcut whenever you want to open the graphical launcher directly, without a command window.
-
-Keep the quotation marks around both paths, especially when a folder name contains spaces. If you are unsure which Python installation is active, run `where pythonw` in Command Prompt.
-
-## Command-line use
-
-Marker 2 example:
-
-```console
-python page_controller.py input.pdf output --marker /path/to/marker_single -- --mode balanced
+```powershell
+$env:MARKER1_EXE = "C:\path\to\marker_single.exe"
+$env:MARKER2_EXE = "C:\path\to\marker_single.exe"
+$env:QPDF_EXE = "C:\path\to\qpdf.exe"
+$env:LLAMA_SERVER = "C:\path\to\llama-server.exe"
+$env:SURYA_MODEL = "C:\path\to\surya.gguf"
+$env:SURYA_MMPROJ = "C:\path\to\surya-mmproj.gguf"
+$env:QWEN_MODEL = "C:\path\to\qwen.gguf"
 ```
 
-Marker 1 example:
+Only configure the Marker 2 and Qwen variables when using those features.
 
-```console
-python page_controller.py input.pdf output --marker /path/to/marker_single -- --layout_batch_size 1 --detection_batch_size 1 --ocr_error_batch_size 1 --recognition_batch_size 1 --equation_batch_size 1 --table_rec_batch_size 1
+## Quick start
+
+Marker 2 is the default engine, including for images. Select Marker 1 explicitly
+with `--engine marker1` when needed.
+
+```powershell
+# Convert one PDF
+.\marker.cmd document.pdf
+
+# Convert selected pages
+.\marker.cmd document.pdf --pages 1-5,8,12-
+
+# Convert multiple PDFs
+.\marker.cmd first.pdf second.pdf -o converted
+
+# Search a folder recursively
+.\marker.cmd documents -o converted --recursive
+
+# Open the desktop interface
+.\marker.cmd --gui
+
+# Resume the most recent unfinished conversion
+.\marker.cmd --resume
 ```
 
-Options after the standalone `--` are passed directly to `marker_single`.
+Use `--dry-run` to inspect file selection without starting conversion:
 
-Add `--keep-intermediate-files` before the standalone `--` when you want to
-inspect successful page runs:
-
-```console
-python page_controller.py input.pdf output --marker /path/to/marker_single --keep-intermediate-files -- --mode balanced
+```powershell
+.\marker.cmd documents -o converted --recursive --dry-run
 ```
 
-## Recovery and output handling
+## Offline tutorial
 
-- A successful page is recorded with an atomic checkpoint.
-- If Marker saved valid Markdown but the controller was interrupted before it
-  wrote the checkpoint, the next run recovers that Markdown instead of running
-  the page again.
-- A failed page remains pending while later pages continue. The combined file
-  contains `<!-- Page N failed and remains pending. -->` at its position.
-- Images referenced by completed pages are copied to `output/images` and their
-  Markdown paths are rewritten to use that stable folder.
-- Intermediate data under `output/_marker_pages` is deleted after complete
-  success. It is retained automatically after interruption or partial failure,
-  and can always be retained with `--keep-intermediate-files` or the GUI option.
+```powershell
+.\marker.cmd --tutorial
+```
 
-The combined result is written to `output/<input-name>.md`.
+The tutorial uses local static content. It can build and preview a command,
+explain the major options, and run local installation checks. It never starts
+a conversion without confirmation and makes no network requests.
 
-## Verify
+## Resume behavior
 
-```console
-python -m unittest -v test_page_controller.py
+Unfinished state is stored under the output folder:
+
+```text
+marker_output/
+└── _marker_work/
+    └── document-1a2b3c4d/
+        ├── run_manifest.json
+        ├── split_pages/
+        └── page_markdown/
+```
+
+Completed compatible pages are reused. Changing batch size, GPU tuning, page
+selection, metadata, or Qwen refinement can retain compatible work. Changing
+the engine or processing mode restarts that document. Changed source contents
+are never combined with stale checkpoints.
+
+## Diagnostics and structured output
+
+```powershell
+.\marker.cmd document.pdf --quiet
+.\marker.cmd document.pdf --verbose --log marker.log
+.\marker.cmd document.pdf --jsonl
+```
+
+Human diagnostics go to standard error. Normal result paths or JSONL records
+go to standard output, making the command suitable for scripts.
+
+## Tests
+
+The unit tests do not require a GPU or model files:
+
+```powershell
+python -m unittest -v test_marker_process.py
 ```
 
 ## License
 
-MIT. This is an independent reference implementation and is not affiliated with Datalab or the Marker project.
-
+MIT
