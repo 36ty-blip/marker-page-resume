@@ -12,15 +12,13 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import urllib.error
 import urllib.request
 from collections import defaultdict
 from pathlib import Path
-
-from pypdf import PdfReader
-
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -29,9 +27,30 @@ def configured_path(name: str, default: str | Path) -> Path:
     return Path(os.environ.get(name, str(default))).expanduser()
 
 
-CLI_VERSION = "1.6.0"
+def normalize_gpu_layers(value: object) -> int | str:
+    text = str(value).strip().casefold()
+    if text in {"auto", "all"}:
+        return text
+    try:
+        layers = int(text)
+    except ValueError as exc:
+        raise ValueError("GPU layers must be Auto, All, or a number of 1 or more.") from exc
+    if layers < 1:
+        raise ValueError("GPU layers must be Auto, All, or a number of 1 or more.")
+    return layers
+
+
+def gpu_layers_argument(value: str) -> int | str:
+    try:
+        return normalize_gpu_layers(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+CLI_VERSION = "1.8.0"
 RUN_MANIFEST_VERSION = 1
 DOCUMENT_METADATA_SCHEMA_VERSION = 1
+GUI_EVENT_PREFIX = "MARKER_GUI_EVENT "
 LAST_RUN_FILE = SCRIPT_DIR / ".marker_last_run.json"
 ACTIVE_RUNS_FILE = configured_path(
     "MARKER_ACTIVE_RUNS_FILE",
@@ -69,6 +88,11 @@ CHROME = Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
 EDGE = Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")
 TIMEOUT = 3600
 RETRIES = 3
+RUNTIME_CHECK_CACHE_ENV = "MARKER_RUNTIME_CHECK_CACHE"
+RUNTIME_CHECK_FORCE_ENV = "MARKER_RUNTIME_CHECK_FORCE"
+RUNTIME_CHECK_CACHE_SECONDS = 15 * 60
+GPU_STATUS_CACHE_SECONDS = 60
+GPU_FIT_CACHE_SECONDS = 5 * 60
 QWEN_CONTEXT_SIZE = 16384
 QWEN_KV_CACHE_TYPE = "f16"
 QWEN_QUANTIZATION = "Q4_K_M"
@@ -114,6 +138,159 @@ MARKER2_IMAGE_EXTENSIONS = {
     ".avif",
 }
 MARKER2_EXTRA_EXTENSIONS = MARKER2_DOCUMENT_EXTENSIONS | MARKER2_IMAGE_EXTENSIONS
+
+
+def format_clock_duration(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, remaining_seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
+
+
+def format_work_duration(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, remaining_seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m {remaining_seconds:04.1f}s"
+    hours, remaining_minutes = divmod(int(minutes), 60)
+    return f"{hours}h {remaining_minutes:02d}m {remaining_seconds:04.1f}s"
+
+
+def format_page_progress_result(
+    label: str, succeeded: bool, seconds: float
+) -> str:
+    outcome = "completed" if succeeded else "failed"
+    icon = "✅" if succeeded else "❌"
+    return f"{label} {outcome} — {format_work_duration(seconds)} {icon}"
+
+
+def should_show_page_progress_result(
+    succeeded: bool, diagnostics: str
+) -> bool:
+    return not succeeded or diagnostics in {"verbose", "debug"}
+
+
+def format_page_ranges(numbers: list[int]) -> str:
+    values = sorted(set(numbers))
+    if not values:
+        return ""
+    ranges = []
+    start = previous = values[0]
+    for number in values[1:]:
+        if number == previous + 1:
+            previous = number
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = number
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return ", ".join(ranges)
+
+
+def format_page_summary(label: str, numbers: list[int], total: int) -> str:
+    noun = "page" if len(numbers) == 1 else "pages"
+    ranges = format_page_ranges(numbers)
+    suffix = f" ({ranges})" if ranges else ""
+    return f"{label}: {len(numbers)}/{total} {noun}{suffix}"
+
+
+def format_runtime_check_summaries(result: dict) -> list[tuple[str, str]]:
+    components = list(result.get("components") or [])
+    if not components:
+        if result.get("status") == "ready":
+            components = [{
+                "label": "Runtime check",
+                "status": "ready",
+                "detail": result.get("gpu", "Ready"),
+            }]
+        else:
+            components = [{
+                "label": "Runtime check",
+                "status": "error",
+                "detail": result.get("error", "Unknown runtime error"),
+            }]
+
+    completed = [
+        str(component.get("label", "Runtime check"))
+        for component in components
+        if component.get("status", "ready") == "ready"
+    ]
+    failed = [
+        component
+        for component in components
+        if component.get("status", "ready") != "ready"
+    ]
+    total = len(components)
+    summaries = [(
+        "ready",
+        f"Ready: {len(completed)}/{total}",
+    )]
+    if failed:
+        failed_noun = "check" if len(failed) == 1 else "checks"
+        exact_failures = "; ".join(
+            f"{component.get('label', 'Runtime check')} — "
+            f"{component.get('detail') or result.get('error', 'Unknown error')}"
+            for component in failed
+        )
+        summaries.append((
+            "failed",
+            f"Fail: {len(failed)}/{total} {failed_noun} ({exact_failures})",
+        ))
+    return summaries
+
+
+def estimate_remaining_seconds(
+    duration_seconds: float,
+    completed_units: int,
+    total_units: int,
+    active_elapsed_seconds: float = 0.0,
+) -> float | None:
+    if total_units <= 0 or completed_units >= total_units:
+        return 0.0
+    if completed_units <= 0:
+        return None
+    average = max(0.0, duration_seconds) / completed_units
+    return max(
+        0.0,
+        average * (total_units - completed_units)
+        - max(0.0, active_elapsed_seconds),
+    )
+
+
+GUI_CONSOLE_NOTICE = (
+    "\nMarker is running.\n"
+    "Close this terminal window to stop Marker.\n"
+    "Completed page checkpoints will be preserved.\n\n"
+)
+WINDOWS_SHOW_MINIMIZED = 2
+
+
+def gui_child_process_options(operation: str) -> dict:
+    if os.name != "nt":
+        return {"creationflags": 0, "start_new_session": True}
+    options = {
+        "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP,
+        "start_new_session": False,
+    }
+    if operation == "conversion":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = WINDOWS_SHOW_MINIMIZED
+        options["startupinfo"] = startupinfo
+    return options
+
+
+def write_gui_console_notice() -> None:
+    if os.name != "nt":
+        return
+    try:
+        with open(
+            "CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1
+        ) as console:
+            console.write(GUI_CONSOLE_NOTICE)
+    except OSError:
+        pass
 
 
 class Reporter:
@@ -177,7 +354,7 @@ class Reporter:
             suffix += f" | ETA {eta:.1f}s"
         line = f"[{current}/{total} {percent:3d}%] {label}{suffix}"
         self._write_log(line, "progress")
-        if self.quiet or self.progress_mode == "quiet":
+        if self.quiet or self.progress_mode == "quiet" or not self.verbose:
             return
         if self.progress_mode == "auto" and sys.stderr.isatty():
             self.progress_width = max(self.progress_width, len(line))
@@ -238,7 +415,7 @@ def launch_gui_with_desktop_python(error: Exception) -> int:
             [
                 str(candidate),
                 "-c",
-                "import pypdf, tkinter as tk; "
+                "import tkinter as tk; "
                 "r=tk.Tk(); r.withdraw(); r.update(); r.destroy()",
             ],
             check=False,
@@ -256,7 +433,7 @@ def launch_gui_with_desktop_python(error: Exception) -> int:
     REPORTER.message(
         "The GUI could not start because this Python installation has no usable "
         f"Tk runtime: {error}\nSet MARKER_GUI_PYTHON to a Python executable with "
-        "tkinter and pypdf installed.",
+        "tkinter installed.",
         "error",
     )
     return 2
@@ -285,13 +462,21 @@ def choose_settings() -> int:
     marker_var = tk.StringVar(value="2.0")
     processing_var = tk.StringVar(value="page")
     pages_var = tk.StringVar()
+    pages_per_process_var = tk.StringVar(value="1")
     batch_var = tk.StringVar(value="1")
+    gpu_layers_var = tk.StringVar(value="auto")
+    performance_label_var = tk.StringVar(value="GPU layers")
+    performance_hint_var = tk.StringVar(value="Auto is recommended")
     diagnostics_var = tk.StringVar(value="standard")
     save_diagnostic_log_var = tk.BooleanVar()
     save_results_file_var = tk.BooleanVar()
     diagnostic_log_var = tk.StringVar()
     results_file_var = tk.StringVar()
     status_var = tk.StringVar(value="Add one or more files or folders to begin.")
+    progress_count_var = tk.StringVar(value="Progress: —")
+    elapsed_time_var = tk.StringVar(value="Elapsed: 00:00:00")
+    eta_time_var = tk.StringVar(value="Estimated remaining: —")
+    current_item_var = tk.StringVar(value="Currently processing: —")
     include_non_pdf_var = tk.BooleanVar()
     recursive_var = tk.BooleanVar()
     keep_intermediate_var = tk.BooleanVar()
@@ -306,6 +491,22 @@ def choose_settings() -> int:
         "results_stream": None,
         "default_diagnostic_log": "",
         "default_results_file": "",
+        "operation": "conversion",
+        "operation_signature": None,
+        "runtime_cache": {"components": {}},
+        "checked_signature": None,
+        "auto_check_job": None,
+        "run_started": None,
+        "run_finished": None,
+        "progress_document": None,
+        "progress_phase": None,
+        "progress_completed": 0,
+        "progress_total": 0,
+        "progress_duration": 0.0,
+        "progress_units": 0,
+        "progress_timed_total": 0,
+        "progress_active_started": None,
+        "progress_rows": {},
     }
 
     def select_file(variable: tk.StringVar, title: str, jsonl: bool = False) -> None:
@@ -432,7 +633,9 @@ def choose_settings() -> int:
             marker_var.set(settings.get("marker_version", "1.10"))
             processing_var.set(settings.get("processing_mode", "page"))
             pages_var.set(settings.get("page_selection") or "")
+            pages_per_process_var.set(str(settings.get("pages_per_process") or 1))
             batch_var.set(str(settings.get("marker1_recognition_batch_size") or 1))
+            gpu_layers_var.set(str(settings.get("gpu_layers") or "auto"))
             create_metadata_var.set(settings.get("create_metadata", True))
             llm_refinement_var.set(settings.get("llm_refinement", False))
             restart_var.set(False)
@@ -453,11 +656,59 @@ def choose_settings() -> int:
         unfinished.bind("<Double-1>", load_selected)
         window.grab_set()
 
+    def current_runtime_signature() -> dict | None:
+        gpu_layers: int | str = "auto"
+        if marker_var.get() == "2.0":
+            try:
+                gpu_layers = normalize_gpu_layers(gpu_layers_var.get())
+            except ValueError:
+                return None
+        return runtime_check_signature(
+            marker_var.get(), processing_var.get(), gpu_layers,
+            llm_refinement_var.get(),
+        )
+
+    def schedule_runtime_check(*_args) -> None:
+        job = state.get("auto_check_job")
+        if job is not None:
+            root.after_cancel(job)
+            state["auto_check_job"] = None
+        signature = current_runtime_signature()
+        if (
+            state["process"] is not None
+            or not signature
+            or state["checked_signature"] == signature
+        ):
+            return
+
+        def run_automatic_check() -> None:
+            state["auto_check_job"] = None
+            if state["process"] is None:
+                launch("check")
+
+        state["auto_check_job"] = root.after(500, run_automatic_check)
+
+    def runtime_settings_changed(*_args) -> None:
+        update_states()
+        schedule_runtime_check()
+
     def update_states(*_args) -> None:
-        batch_spinbox.configure(
-            state="normal" if marker_var.get() == "1.10" else "disabled"
+        marker1 = marker_var.get() == "1.10"
+        performance_label_var.set(
+            "Recognition batch" if marker1 else "GPU layers"
+        )
+        performance_hint_var.set(
+            "Higher values use more memory" if marker1 else "Auto is recommended"
+        )
+        performance_spinbox.configure(
+            textvariable=batch_var if marker1 else gpu_layers_var,
+            to=256 if marker1 else 999,
+            values=() if marker1 else ("auto", "all", "10", "20", "30"),
         )
         pages_entry.configure(
+            state="normal" if processing_var.get() == "page" else "disabled"
+        )
+        pages_per_process_spinbox.configure(
             state="normal" if processing_var.get() == "page" else "disabled"
         )
         if not create_metadata_var.get():
@@ -494,36 +745,247 @@ def choose_settings() -> int:
         diagnostics_text.see(tk.END)
         diagnostics_text.configure(state="disabled")
 
+    def set_progress_row(row_id: str, text: str, tag: str) -> None:
+        diagnostics_text.configure(state="normal")
+        mark = state["progress_rows"].get(row_id)
+        if mark is None:
+            mark = f"page_progress_{len(state['progress_rows'])}"
+            start = diagnostics_text.index("end-1c")
+            diagnostics_text.mark_set(mark, start)
+            diagnostics_text.mark_gravity(mark, tk.LEFT)
+            state["progress_rows"][row_id] = mark
+            diagnostics_text.insert(start, text + chr(10), tag)
+        else:
+            start = diagnostics_text.index(mark)
+            diagnostics_text.delete(start, f"{start} lineend")
+            diagnostics_text.insert(start, text, tag)
+        diagnostics_text.see(tk.END)
+        diagnostics_text.configure(state="disabled")
+
+    def handle_page_progress(record: dict) -> None:
+        event = record.get("event")
+        source = record.get("source")
+        phase = record.get("phase", "processing")
+        total = max(0, int(record.get("total", 0)))
+        current = max(0, int(record.get("current", 0)))
+        completed = max(0, int(record.get("completed", 0)))
+        label = str(record.get("label", "Page"))
+        row_id = str(record.get("row_id", f"{source}:{label}"))
+
+        if (
+            source != state["progress_document"]
+            or phase != state["progress_phase"]
+        ):
+            state["progress_document"] = source
+            state["progress_phase"] = phase
+            state["progress_completed"] = 0
+            state["progress_total"] = total
+            state["progress_duration"] = 0.0
+            state["progress_units"] = 0
+            state["progress_timed_total"] = max(
+                0, int(record.get("timed_total", total))
+            )
+            state["progress_active_started"] = None
+
+        state["progress_total"] = total
+        state["progress_timed_total"] = max(
+            0, int(record.get("timed_total", total))
+        )
+        percent = int(current / total * 100) if total else 100
+        progress.stop()
+        progress.configure(mode="determinate", value=percent)
+        progress_count_var.set(f"Progress: {current} / {total} ({percent}%)")
+
+        if event == "started":
+            state["progress_completed"] = completed
+            state["progress_active_started"] = (
+                None if record.get("resumed") else time.monotonic()
+            )
+            action = "refining" if phase == "refining" else "processing"
+            current_item_var.set(
+                f"Currently processing: {label}"
+                + (" (refining)" if phase == "refining" else "")
+            )
+            if diagnostics_var.get() in {"verbose", "debug"}:
+                set_progress_row(row_id, f"{label} {action}…", "progress_active")
+            return
+
+        if event != "finished":
+            return
+        duration = max(0.0, float(record.get("duration_seconds", 0.0)))
+        units = max(0, current - completed)
+        state["progress_completed"] = current
+        if not record.get("resumed"):
+            state["progress_duration"] += duration
+            state["progress_units"] += units
+        state["progress_active_started"] = None
+        current_item_var.set("Currently processing: —")
+        display_duration = max(
+            0.0, float(record.get("total_duration_seconds", duration))
+        )
+        succeeded = record.get("status") == "success"
+        if succeeded:
+            text = format_page_progress_result(label, True, display_duration)
+            tag = "progress_success"
+        else:
+            text = format_page_progress_result(label, False, display_duration)
+            tag = "progress_error"
+        if should_show_page_progress_result(succeeded, diagnostics_var.get()):
+            set_progress_row(row_id, text, tag)
+
+    def update_live_clock() -> None:
+        started = state["run_started"]
+        if started is not None:
+            now = state["run_finished"] or time.monotonic()
+            elapsed_time_var.set(
+                f"Elapsed: {format_clock_duration(now - started)}"
+            )
+            total = state["progress_total"]
+            completed = state["progress_completed"]
+            units = state["progress_units"]
+            if total and completed >= total:
+                eta_time_var.set("Estimated remaining: 00:00:00")
+            else:
+                active_started = state["progress_active_started"]
+                active_elapsed = (
+                    time.monotonic() - active_started
+                    if active_started is not None else 0.0
+                )
+                estimate = estimate_remaining_seconds(
+                    state["progress_duration"],
+                    units,
+                    state["progress_timed_total"],
+                    active_elapsed,
+                )
+                if estimate is None:
+                    eta_time_var.set("Estimated remaining: Calculating…")
+                else:
+                    eta_time_var.set(
+                        f"Estimated remaining: {format_clock_duration(estimate)}"
+                    )
+        root.after(250, update_live_clock)
+
     def clear_run_view() -> None:
         progress.stop()
         progress.configure(mode="determinate", value=0)
         for item in results.get_children():
             results.delete(item)
         diagnostics_text.configure(state="normal")
+        for mark in state["progress_rows"].values():
+            diagnostics_text.mark_unset(mark)
         diagnostics_text.delete("1.0", tk.END)
         diagnostics_text.configure(state="disabled")
+        state["progress_rows"] = {}
+        state["run_started"] = None
+        state["run_finished"] = None
+        state["progress_document"] = None
+        state["progress_phase"] = None
+        state["progress_completed"] = 0
+        state["progress_total"] = 0
+        state["progress_duration"] = 0.0
+        state["progress_units"] = 0
+        state["progress_timed_total"] = 0
+        state["progress_active_started"] = None
+        progress_count_var.set("Progress: —")
+        elapsed_time_var.set("Elapsed: 00:00:00")
+        eta_time_var.set("Estimated remaining: —")
+        current_item_var.set("Currently processing: —")
 
     def handle_result(record: dict) -> None:
+        appearances = {
+            "success": ("✅ Completed", "success"),
+            "ready": ("✅ Ready", "success"),
+            "found": ("✅ Found", "success"),
+            "incomplete": ("⚠️ Needs attention", "warning"),
+            "conflict": ("⚠️ Conflict", "warning"),
+            "skipped": ("⚠️ Skipped", "warning"),
+            "failed": ("❌ Failed", "error"),
+            "error": ("❌ Error", "error"),
+            "interrupted": ("⚠️ Stopped", "warning"),
+            "selected": ("Selected", ""),
+        }
+
+        def appearance(status: str) -> tuple[str, tuple[str, ...]]:
+            label, tag = appearances.get(status, (status.title(), ""))
+            return label, (tag,) if tag else ()
+
         record_type = record.get("type")
         if record_type == "result":
             source = Path(record.get("source", "")).name
             outputs = ", ".join(Path(path).name for path in record.get("outputs", []))
             detail = record.get("error") or outputs
-            results.insert("", tk.END, values=(source, record.get("status", ""), detail))
-            status_var.set(f"{source}: {record.get('status', 'finished')}")
+            status, tags = appearance(record.get("status", ""))
+            results.insert("", tk.END, values=(source, status, detail), tags=tags)
+            status_var.set(f"{source}: {status}")
+        elif record_type == "plan":
+            source = Path(record.get("source", "")).name
+            settings = ", ".join(
+                str(value) for value in (
+                    record.get("engine"),
+                    record.get("mode"),
+                    f"pages {record['pages']}" if record.get("pages") else None,
+                )
+                if value
+            )
+            detail = record.get("error") or " | ".join(
+                value for value in (record.get("output", ""), settings) if value
+            )
+            status, tags = appearance(record.get("status", ""))
+            results.insert("", tk.END, values=(source, status, detail), tags=tags)
+            status_var.set(f"Previewed: {source}")
+        elif record_type == "check":
+            record_status = record.get("status", "")
+            cache = record.get("cache")
+            if isinstance(cache, dict) and isinstance(cache.get("components"), dict):
+                state["runtime_cache"] = cache
+            components = record.get("components", [])
+            for summary_status, detail in format_runtime_check_summaries(record):
+                status, tags = appearance(
+                    "ready" if summary_status == "ready" else "failed"
+                )
+                results.insert(
+                    "", tk.END,
+                    values=("Runtime checks", status, detail),
+                    tags=tags,
+                )
+            if record_status == "ready":
+                state["checked_signature"] = state["operation_signature"]
+                reused = components and all(item.get("cached") for item in components)
+                status_var.set(
+                    "All runtime checks were reused."
+                    if reused else "Runtime check passed."
+                )
+            else:
+                state["checked_signature"] = None
+                status_var.set(record.get("error", "Runtime check failed."))
         elif record_type == "summary":
             progress.stop()
             progress.configure(mode="determinate", value=100)
-            detail = (
-                f"{record.get('succeeded', 0)} succeeded, "
-                f"{record.get('failed', 0) + record.get('incomplete', 0)} incomplete, "
-                f"{record.get('skipped', 0)} skipped"
+            if record.get("dry_run"):
+                detail = (
+                    f"{record.get('selected', 0)} selected, "
+                    f"{record.get('conflicts', 0)} conflicts, "
+                    f"{record.get('skipped', 0)} skipped"
+                )
+                label = "Preview summary"
+            else:
+                detail = (
+                    f"{record.get('succeeded', 0)} succeeded, "
+                    f"{record.get('failed', 0) + record.get('incomplete', 0)} incomplete, "
+                    f"{record.get('skipped', 0)} skipped"
+                )
+                label = "Run summary"
+            warning = any(
+                record.get(key, 0)
+                for key in ("conflicts", "failed", "incomplete", "skipped")
             )
-            results.insert("", tk.END, values=("Run summary", "complete", detail))
+            status, tags = appearance("incomplete" if warning else "success")
+            results.insert("", tk.END, values=(label, status, detail), tags=tags)
             status_var.set(detail.capitalize() + ".")
         elif record_type in {"error", "interrupted"}:
             detail = record.get("error", "Conversion paused")
-            results.insert("", tk.END, values=("Run", record_type, detail))
+            status, tags = appearance(record_type)
+            results.insert("", tk.END, values=("Run", status, detail), tags=tags)
             status_var.set(detail)
 
     def read_stream(kind: str, stream) -> None:
@@ -552,13 +1014,25 @@ def choose_settings() -> int:
                 except json.JSONDecodeError:
                     append_diagnostic(line)
             else:
+                if line.startswith(GUI_EVENT_PREFIX):
+                    try:
+                        handle_page_progress(
+                            json.loads(line[len(GUI_EVENT_PREFIX):])
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        append_diagnostic(line)
+                    continue
                 match = re.search(r"\[(\d+)/(\d+)\s+(\d+)%\]\s*(.*)", line)
                 if match:
                     progress.stop()
                     progress.configure(
                         mode="determinate", value=int(match.group(3))
                     )
-                    status_var.set(match.group(4))
+                    progress_count_var.set(
+                        f"Progress: {match.group(1)} / {match.group(2)} "
+                        f"({match.group(3)}%)"
+                    )
+                    continue
                 if diagnostics_var.get() != "quiet":
                     append_diagnostic(line)
 
@@ -571,32 +1045,85 @@ def choose_settings() -> int:
                 stream.close()
                 state["results_stream"] = None
             start_button.configure(state="normal")
+            preview_button.configure(state="normal")
+            check_button.configure(state="normal")
             stop_button.configure(state="disabled")
             progress.stop()
             progress.configure(mode="determinate")
+            if state["operation"] == "conversion" and state["run_started"] is not None:
+                state["run_finished"] = time.monotonic()
+                state["progress_active_started"] = None
             if process.returncode == 0:
-                status_var.set("Conversion finished successfully.")
+                status_var.set({
+                    "conversion": "Conversion finished successfully.",
+                    "preview": "Preview complete; no files were changed.",
+                    "check": "Runtime check passed.",
+                }[state["operation"]])
+                if state["operation"] == "conversion":
+                    current_item_var.set("Currently processing: Finished")
+                    eta_time_var.set("Estimated remaining: 00:00:00")
             elif process.returncode == 130:
-                status_var.set("Conversion paused; checkpoints were preserved.")
+                status_var.set("Operation stopped.")
+                if state["operation"] == "conversion":
+                    current_item_var.set("Currently processing: Stopped")
+                    eta_time_var.set("Estimated remaining: —")
             else:
-                status_var.set(f"Conversion finished with exit code {process.returncode}.")
+                status_var.set({
+                    "conversion": f"Conversion finished with exit code {process.returncode}.",
+                    "preview": "Preview found conflicts or no usable inputs.",
+                    "check": "Runtime check failed; see the results and diagnostics.",
+                }[state["operation"]])
+                if state["operation"] == "conversion":
+                    current_item_var.set("Currently processing: Failed")
+                    eta_time_var.set("Estimated remaining: —")
+            if state["operation_signature"] != current_runtime_signature():
+                schedule_runtime_check()
         root.after(100, poll_process)
 
-    def command_arguments() -> list[str] | None:
+    def command_arguments(operation: str = "conversion") -> list[str] | None:
         inputs = list(input_list.get(0, tk.END))
         output = output_var.get().strip()
+        try:
+            batch_size = int(batch_var.get())
+        except ValueError:
+            batch_size = 0
+        try:
+            gpu_layers = normalize_gpu_layers(gpu_layers_var.get())
+        except ValueError:
+            gpu_layers = None
+        if marker_var.get() == "1.10" and batch_size < 1:
+            messagebox.showerror("Invalid batch size", "Batch size must be at least 1.")
+            return None
+        if marker_var.get() == "2.0" and gpu_layers is None:
+            messagebox.showerror(
+                "Invalid GPU layers",
+                "GPU layers must be Auto, All, or a number of 1 or more.",
+            )
+            return None
+        engine = "marker1" if marker_var.get() == "1.10" else "marker2"
+        if operation == "check":
+            arguments = [
+                "--check", "--engine", engine, "--mode", processing_var.get(), "--jsonl",
+            ]
+            if engine == "marker2":
+                arguments.extend(["--gpu-layers", str(gpu_layers)])
+            if llm_refinement_var.get():
+                arguments.append("--refine")
+            return arguments
+        try:
+            pages_per_process = int(pages_per_process_var.get())
+        except ValueError:
+            pages_per_process = 0
+        if pages_per_process < 1:
+            messagebox.showerror(
+                "Invalid pages per process", "Pages per process must be at least 1."
+            )
+            return None
         if not inputs:
             messagebox.showerror("Missing input", "Add at least one input file or folder.")
             return None
         if not output:
             messagebox.showerror("Missing output", "Select an output folder.")
-            return None
-        try:
-            batch_size = int(batch_var.get())
-        except ValueError:
-            batch_size = 0
-        if marker_var.get() == "1.10" and batch_size < 1:
-            messagebox.showerror("Invalid batch size", "Batch size must be at least 1.")
             return None
         pages = pages_var.get().strip()
         if pages and processing_var.get() == "page":
@@ -608,13 +1135,18 @@ def choose_settings() -> int:
 
         arguments = [
             *inputs, "--output", output,
-            "--engine", "marker1" if marker_var.get() == "1.10" else "marker2",
+            "--engine", engine,
             "--mode", processing_var.get(), "--progress", "plain", "--jsonl",
+            "--gui-events",
         ]
         if pages and processing_var.get() == "page":
             arguments.extend(["--pages", pages])
+        if processing_var.get() == "page":
+            arguments.extend(["--pages-per-process", str(pages_per_process)])
         if marker_var.get() == "1.10":
             arguments.extend(["--marker1-recognition-batch-size", str(batch_size)])
+        else:
+            arguments.extend(["--gpu-layers", str(gpu_layers)])
         for enabled, flag in (
             (include_non_pdf_var.get(), "--include-non-pdf"),
             (recursive_var.get(), "--recursive"),
@@ -625,6 +1157,9 @@ def choose_settings() -> int:
         ):
             if enabled:
                 arguments.append(flag)
+        if operation == "preview":
+            arguments.append("--dry-run")
+            return arguments
         if diagnostics_var.get() in {"verbose", "debug"}:
             arguments.append("--" + diagnostics_var.get())
         diagnostic_log = diagnostic_log_var.get().strip()
@@ -646,12 +1181,13 @@ def choose_settings() -> int:
                 source,
                 marker_var.get(),
                 processing_var.get(),
-                30,
+                gpu_layers,
                 True,
                 batch_size,
                 llm_refinement_var.get(),
                 create_metadata_var.get(),
                 pages if processing_var.get() == "page" else None,
+                pages_per_process,
             )
             if not same_source_content(
                 saved_manifest.get("source", {}), current_manifest.get("source", {})
@@ -667,7 +1203,7 @@ def choose_settings() -> int:
                     "marker_version", "processing_mode", "page_selection",
                     "gpu_layers", "marker1_offload",
                     "marker1_recognition_batch_size", "create_metadata",
-                    "llm_refinement",
+                    "llm_refinement", "pages_per_process",
                 )
                 if saved_manifest.get("settings", {}).get(key)
                 != current_manifest.get("settings", {}).get(key)
@@ -682,6 +1218,7 @@ def choose_settings() -> int:
                 "gpu_layers": "GPU layers",
                 "marker1_offload": "model offloading",
                 "marker1_recognition_batch_size": "recognition batch size",
+                "pages_per_process": "pages per process",
                 "create_metadata": "rich metadata",
                 "llm_refinement": "Qwen refinement",
                 "runtime files": "runtime files",
@@ -712,7 +1249,7 @@ def choose_settings() -> int:
                 except RuntimeError as exc:
                     messagebox.showerror("Cannot resume together", str(exc))
                     return None
-                presentation = ["--progress", "plain", "--jsonl"]
+                presentation = ["--progress", "plain", "--jsonl", "--gui-events"]
                 if diagnostics_var.get() in {"verbose", "debug"}:
                     presentation.append("--" + diagnostics_var.get())
                 if diagnostic_log:
@@ -722,14 +1259,16 @@ def choose_settings() -> int:
                 arguments.extend(["--resume-settings", "current"])
         return arguments
 
-    def start() -> None:
-        arguments = command_arguments()
+    def launch(operation: str, force_runtime: bool = False) -> None:
+        arguments = command_arguments(operation)
         if arguments is None:
             return
         results_file = (
-            results_file_var.get().strip() if save_results_file_var.get() else ""
+            results_file_var.get().strip()
+            if operation == "conversion" and save_results_file_var.get()
+            else ""
         )
-        if save_results_file_var.get() and not results_file:
+        if operation == "conversion" and save_results_file_var.get() and not results_file:
             results_file = str(
                 Path(output_var.get().strip()) / "marker-results.jsonl"
             )
@@ -748,6 +1287,8 @@ def choose_settings() -> int:
                 return
         clear_run_view()
         state["eof"] = set()
+        state["operation"] = operation
+        state["operation_signature"] = current_runtime_signature()
         conversion_python = SCRIPT_DIR / ".venv" / "Scripts" / "python.exe"
         command = [
             str(conversion_python if conversion_python.is_file() else sys.executable),
@@ -756,6 +1297,14 @@ def choose_settings() -> int:
         ]
         environment = os.environ.copy()
         environment["PYTHONIOENCODING"] = "utf-8"
+        cached_check = (
+            state["checked_signature"] == state["operation_signature"]
+            and bool(state["runtime_cache"].get("components"))
+        )
+        if operation in {"check", "conversion"}:
+            environment[RUNTIME_CHECK_CACHE_ENV] = json.dumps(state["runtime_cache"])
+        if force_runtime:
+            environment[RUNTIME_CHECK_FORCE_ENV] = "1"
         try:
             state["process"] = subprocess.Popen(
                 command,
@@ -766,10 +1315,7 @@ def choose_settings() -> int:
                 errors="replace",
                 bufsize=1,
                 env=environment,
-                creationflags=(
-                    subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-                ),
-                start_new_session=os.name != "nt",
+                **gui_child_process_options(operation),
             )
         except OSError as exc:
             stream = state["results_stream"]
@@ -778,9 +1324,23 @@ def choose_settings() -> int:
                 state["results_stream"] = None
             messagebox.showerror("Cannot start conversion", str(exc))
             return
+        if operation == "conversion":
+            state["run_started"] = time.monotonic()
+            state["run_finished"] = None
+            elapsed_time_var.set("Elapsed: 00:00:00")
+            eta_time_var.set("Estimated remaining: Calculating…")
         start_button.configure(state="disabled")
+        preview_button.configure(state="disabled")
+        check_button.configure(state="disabled")
         stop_button.configure(state="normal")
-        status_var.set("Checking runtime and starting conversion…")
+        status_var.set({
+            "conversion": (
+                "Using the previous runtime check and starting conversion…"
+                if cached_check else "Checking runtime and starting conversion…"
+            ),
+            "preview": "Previewing selected files and settings…",
+            "check": "Checking runtime and GPU…",
+        }[operation])
         progress.configure(mode="indeterminate")
         progress.start(12)
         for kind in ("stdout", "stderr"):
@@ -788,6 +1348,15 @@ def choose_settings() -> int:
             threading.Thread(
                 target=read_stream, args=(kind, stream), daemon=True
             ).start()
+
+    def start() -> None:
+        launch("conversion")
+
+    def preview() -> None:
+        launch("preview")
+
+    def check() -> None:
+        launch("check", force_runtime=True)
 
     def stop() -> None:
         process = state["process"]
@@ -818,8 +1387,8 @@ def choose_settings() -> int:
     frame.grid(sticky="nsew")
     frame.columnconfigure(1, weight=1)
     frame.rowconfigure(1, weight=1)
-    frame.rowconfigure(13, weight=2)
-    frame.rowconfigure(14, weight=1)
+    frame.rowconfigure(15, weight=2)
+    frame.rowconfigure(16, weight=1)
 
     ttk.Label(frame, text="Inputs").grid(row=0, column=0, sticky="nw", pady=4)
     input_frame = ttk.Frame(frame)
@@ -875,14 +1444,29 @@ def choose_settings() -> int:
     pages_entry.grid(row=5, column=1, sticky="ew", padx=8, pady=4)
     ttk.Label(frame, text="e.g. 1-5,8,12-").grid(row=5, column=2, sticky="w")
 
-    ttk.Label(frame, text="Recognition batch").grid(row=6, column=0, sticky="w", pady=4)
-    batch_spinbox = ttk.Spinbox(
-        frame, from_=1, to=256, textvariable=batch_var, width=8
+    ttk.Label(frame, text="Pages at a time").grid(
+        row=6, column=0, sticky="w", pady=4
     )
-    batch_spinbox.grid(row=6, column=1, sticky="w", padx=8, pady=4)
+    pages_per_process_spinbox = ttk.Spinbox(
+        frame, from_=1, to=100, textvariable=pages_per_process_var, width=8
+    )
+    pages_per_process_spinbox.grid(row=6, column=1, sticky="w", padx=8, pady=4)
+    ttk.Label(frame, text="1 = safest").grid(row=6, column=2, sticky="w")
+
+    ttk.Label(frame, textvariable=performance_label_var).grid(
+        row=7, column=0, sticky="w", pady=4
+    )
+    performance_spinbox = ttk.Spinbox(
+        frame, from_=1, to=999, textvariable=gpu_layers_var, width=8,
+        values=("auto", "all", "10", "20", "30"),
+    )
+    performance_spinbox.grid(row=7, column=1, sticky="w", padx=8, pady=4)
+    ttk.Label(frame, textvariable=performance_hint_var).grid(
+        row=7, column=2, sticky="w"
+    )
 
     options = ttk.Frame(frame)
-    options.grid(row=7, column=0, columnspan=3, sticky="ew", pady=4)
+    options.grid(row=8, column=0, columnspan=3, sticky="ew", pady=4)
     for column, (label, variable) in enumerate((
         ("Include non-PDF", include_non_pdf_var),
         ("Search folders recursively", recursive_var),
@@ -900,78 +1484,109 @@ def choose_settings() -> int:
     )
     qwen_check.grid(row=1, column=1, sticky="w", pady=(4, 0))
 
-    ttk.Label(frame, text="Diagnostics").grid(row=8, column=0, sticky="w", pady=4)
+    ttk.Label(frame, text="Diagnostics").grid(row=9, column=0, sticky="w", pady=4)
     ttk.Combobox(
         frame, textvariable=diagnostics_var,
         values=("quiet", "standard", "verbose", "debug"),
         state="readonly", width=12,
-    ).grid(row=8, column=1, sticky="w", padx=8, pady=4)
+    ).grid(row=9, column=1, sticky="w", padx=8, pady=4)
 
     ttk.Checkbutton(
         frame, text="Save diagnostic log", variable=save_diagnostic_log_var,
         command=update_states,
-    ).grid(row=9, column=0, sticky="w", pady=4)
+    ).grid(row=10, column=0, sticky="w", pady=4)
     diagnostic_log_entry = ttk.Entry(frame, textvariable=diagnostic_log_var)
     diagnostic_log_entry.grid(
-        row=9, column=1, sticky="ew", padx=8, pady=4
+        row=10, column=1, sticky="ew", padx=8, pady=4
     )
     diagnostic_log_button = ttk.Button(
         frame, text="Browse…",
         command=lambda: select_file(diagnostic_log_var, "Save diagnostic log"),
     )
-    diagnostic_log_button.grid(row=9, column=2, sticky="ew", pady=4)
+    diagnostic_log_button.grid(row=10, column=2, sticky="ew", pady=4)
 
     ttk.Checkbutton(
         frame, text="Save results JSONL", variable=save_results_file_var,
         command=update_states,
-    ).grid(row=10, column=0, sticky="w", pady=4)
+    ).grid(row=11, column=0, sticky="w", pady=4)
     results_file_entry = ttk.Entry(frame, textvariable=results_file_var)
     results_file_entry.grid(
-        row=10, column=1, sticky="ew", padx=8, pady=4
+        row=11, column=1, sticky="ew", padx=8, pady=4
     )
     results_file_button = ttk.Button(
         frame, text="Browse…",
         command=lambda: select_file(results_file_var, "Save structured results", True),
     )
-    results_file_button.grid(row=10, column=2, sticky="ew", pady=4)
+    results_file_button.grid(row=11, column=2, sticky="ew", pady=4)
 
     ttk.Label(frame, textvariable=status_var).grid(
-        row=11, column=0, columnspan=3, sticky="w", pady=(8, 2)
+        row=12, column=0, columnspan=3, sticky="w", pady=(8, 2)
     )
+    live_status = ttk.LabelFrame(frame, text="Live progress", padding=(8, 5))
+    live_status.grid(
+        row=13, column=0, columnspan=3, sticky="ew", pady=(0, 6)
+    )
+    live_status.columnconfigure(3, weight=1)
+    for column, variable in enumerate((
+        progress_count_var, elapsed_time_var, eta_time_var, current_item_var,
+    )):
+        ttk.Label(live_status, textvariable=variable).grid(
+            row=0, column=column, sticky="w", padx=(0 if column == 0 else 18, 0)
+        )
     progress = ttk.Progressbar(frame, mode="determinate", maximum=100)
-    progress.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+    progress.grid(row=14, column=0, columnspan=3, sticky="ew", pady=(0, 8))
 
     results = ttk.Treeview(
         frame, columns=("source", "status", "details"), show="headings", height=6
     )
     results.heading("source", text="Source")
     results.heading("status", text="Status")
-    results.heading("details", text="Output or error")
+    results.heading("details", text="What happened")
     results.column("source", width=180)
-    results.column("status", width=90, anchor="center")
+    results.column("status", width=150, anchor="center")
     results.column("details", width=520)
-    results.grid(row=13, column=0, columnspan=3, sticky="nsew", pady=4)
+    results.tag_configure("success", foreground="#188038")
+    results.tag_configure("warning", foreground="#C26401")
+    results.tag_configure("error", foreground="#C5221F")
+    results.grid(row=15, column=0, columnspan=3, sticky="nsew", pady=4)
 
-    diagnostics_text = tk.Text(frame, height=6, wrap="word", state="disabled")
-    diagnostics_text.grid(row=14, column=0, columnspan=3, sticky="nsew", pady=4)
+    activity_frame = ttk.LabelFrame(frame, text="Activity log", padding=(6, 4))
+    activity_frame.grid(row=16, column=0, columnspan=3, sticky="nsew", pady=4)
+    activity_frame.columnconfigure(0, weight=1)
+    activity_frame.rowconfigure(0, weight=1)
+    diagnostics_text = tk.Text(
+        activity_frame, height=6, wrap="word", state="disabled"
+    )
+    diagnostics_text.tag_configure("progress_active", foreground="#1A73E8")
+    diagnostics_text.tag_configure("progress_success", foreground="#188038")
+    diagnostics_text.tag_configure("progress_error", foreground="#C5221F")
+    diagnostics_text.grid(row=0, column=0, sticky="nsew")
 
     buttons = ttk.Frame(frame)
-    buttons.grid(row=15, column=0, columnspan=3, sticky="e", pady=(8, 0))
+    buttons.grid(row=17, column=0, columnspan=3, sticky="e", pady=(8, 0))
+    check_button = ttk.Button(buttons, text="Check runtime", command=check)
+    check_button.grid(row=0, column=0)
+    preview_button = ttk.Button(buttons, text="Preview", command=preview)
+    preview_button.grid(row=0, column=1, padx=(8, 0))
     stop_button = ttk.Button(buttons, text="Stop safely", command=stop, state="disabled")
-    stop_button.grid(row=0, column=0)
+    stop_button.grid(row=0, column=2, padx=(8, 0))
     start_button = ttk.Button(buttons, text="Start conversion", command=start)
-    start_button.grid(row=0, column=1, padx=(8, 0))
+    start_button.grid(row=0, column=3, padx=(8, 0))
     ttk.Button(buttons, text="Close", command=close).grid(
-        row=0, column=2, padx=(8, 0)
+        row=0, column=4, padx=(8, 0)
     )
 
-    marker_var.trace_add("write", update_states)
+    marker_var.trace_add("write", runtime_settings_changed)
     processing_var.trace_add("write", update_states)
-    create_metadata_var.trace_add("write", update_states)
+    create_metadata_var.trace_add("write", runtime_settings_changed)
+    gpu_layers_var.trace_add("write", schedule_runtime_check)
+    llm_refinement_var.trace_add("write", schedule_runtime_check)
     output_var.trace_add("write", update_states)
     update_states()
     root.protocol("WM_DELETE_WINDOW", close)
     root.after(100, poll_process)
+    root.after(250, update_live_clock)
+    root.after(250, schedule_runtime_check)
     root.mainloop()
     return int(state["last_code"])
 
@@ -1043,7 +1658,7 @@ def run_quietly(command: list[str], env: dict, timeout: int) -> None:
         raise subprocess.CalledProcessError(returncode, command)
 
 
-def verify_gpu(marker_version: str, gpu_layers: int, llm_refinement: bool) -> str:
+def verify_gpu(marker_version: str, gpu_layers: int | str, llm_refinement: bool) -> str:
     try:
         nvidia = subprocess.run(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
@@ -1076,8 +1691,8 @@ def verify_gpu(marker_version: str, gpu_layers: int, llm_refinement: bool) -> st
                 "Marker 1.10's PyTorch environment cannot initialize CUDA."
             )
 
-    if marker_version == "2.0" and gpu_layers == 0:
-        raise RuntimeError("Marker 2.0 GPU layers are set to zero.")
+    if marker_version == "2.0":
+        normalize_gpu_layers(gpu_layers)
     if marker_version == "2.0" or llm_refinement:
         llama_probe = subprocess.run(
             [str(LLAMA_SERVER), "--list-devices"],
@@ -1270,12 +1885,106 @@ def split_pdf(pdf: Path, folder: Path, page_count: int) -> list[Path]:
     return pages
 
 
+def page_groups(page_numbers: list[int], pages_per_process: int) -> list[list[int]]:
+    return [
+        page_numbers[index:index + pages_per_process]
+        for index in range(0, len(page_numbers), pages_per_process)
+    ]
+
+
+def page_group_name(numbers: list[int]) -> str:
+    if len(numbers) == 1:
+        return f"page{numbers[0]:04}"
+    digest = hashlib.sha256(",".join(map(str, numbers)).encode("ascii")).hexdigest()[:8]
+    return f"pages{numbers[0]:04}-{numbers[-1]:04}-{digest}"
+
+
+def page_group_label(numbers: list[int]) -> str:
+    if len(numbers) == 1:
+        return f"Page {numbers[0]}"
+    consecutive = numbers == list(range(numbers[0], numbers[-1] + 1))
+    return (
+        f"Pages {numbers[0]}–{numbers[-1]}"
+        if consecutive else "Pages " + ", ".join(map(str, numbers))
+    )
+
+
+def create_page_group(
+    split_pages: list[Path], numbers: list[int], folder: Path
+) -> Path:
+    if len(numbers) == 1:
+        return split_pages[numbers[0] - 1]
+    folder.mkdir(parents=True, exist_ok=True)
+    destination = folder / f"{page_group_name(numbers)}.pdf"
+    if destination.is_file():
+        try:
+            if qpdf_page_count(destination) == len(numbers):
+                return destination
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            pass
+    pending = destination.with_suffix(".pending.pdf")
+    pending.unlink(missing_ok=True)
+    command = [str(QPDF), "--empty", "--pages"]
+    for number in numbers:
+        command.extend([str(split_pages[number - 1]), "1"])
+    command.extend(["--", str(pending)])
+    REPORTER.message(f"Command: {subprocess.list2cmdline(command)}", "debug")
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if result.returncode not in {0, 3}:
+        pending.unlink(missing_ok=True)
+        detail = (result.stderr or result.stdout).strip()
+        message = detail.splitlines()[-1] if detail else "unknown qpdf error"
+        raise RuntimeError(f"qpdf could not create {destination.name}: {message}")
+    if qpdf_page_count(pending) != len(numbers):
+        pending.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Expected {len(numbers)} pages in {destination.name}"
+        )
+    pending.replace(destination)
+    return destination
+
+
+def qpdf_page_count(path: Path, check_structure: bool = False) -> int:
+    command = [str(QPDF)]
+    if check_structure:
+        command.append("--check")
+    command.extend(["--show-npages", str(path)])
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=120,
+    )
+    if result.returncode not in {0, 3}:
+        detail = (result.stderr or result.stdout).strip()
+        message = detail.splitlines()[-1] if detail else "unknown qpdf error"
+        raise RuntimeError(f"qpdf could not read {path.name}: {message}")
+    for line in reversed(result.stdout.splitlines()):
+        if line.strip().isdigit():
+            page_count = int(line.strip())
+            if page_count > 0:
+                return page_count
+            break
+    raise RuntimeError(f"qpdf reported no pages for {path.name}")
+
+
 def valid_pdf(path: Path) -> bool:
     if not path.is_file() or not path.stat().st_size:
         return False
     try:
-        return len(PdfReader(str(path)).pages) > 0
-    except Exception:
+        qpdf_page_count(path, check_structure=True)
+        return True
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
         return False
 
 
@@ -1406,7 +2115,7 @@ def prepare_input_pdf(source: Path, work_dir: Path) -> Path:
         raise RuntimeError(f"Pre-conversion did not create a valid PDF for {source.name}")
     pending.replace(converted)
     REPORTER.message(
-        f"Pre-conversion complete: {len(PdfReader(str(converted)).pages)} page(s)"
+        f"Pre-conversion complete: {qpdf_page_count(converted)} page(s)"
     )
     return converted
 
@@ -1469,7 +2178,7 @@ def recover_saved_markdown(
 
 
 def marker_environment(
-    marker_version: str, gpu_layers: int, marker1_offload: bool
+    marker_version: str, gpu_layers: int | str, marker1_offload: bool
 ) -> tuple[Path, dict, list[str]]:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = "0"
@@ -1509,7 +2218,7 @@ def convert_input(
     source: Path,
     checkpoint_dir: Path,
     marker_version: str,
-    gpu_layers: int,
+    gpu_layers: int | str,
     marker1_offload: bool,
     marker1_recognition_batch_size: int,
     create_metadata: bool = True,
@@ -1605,6 +2314,7 @@ def copy_markdown_and_images(
     output_file: Path,
     existing_image_map: dict[Path, str] | None = None,
     page_numbers: list[int] | None = None,
+    grouped_page_numbers: list[list[int]] | None = None,
 ) -> dict[Path, str]:
     chunks = []
     image_dir = output_file.parent / "images"
@@ -1615,9 +2325,12 @@ def copy_markdown_and_images(
     image_count = len(copied)
 
     page_numbers = page_numbers or list(range(1, len(markdowns) + 1))
-    for number, markdown in zip(page_numbers, markdowns):
+    groups = grouped_page_numbers or [[number] for number in page_numbers]
+    for numbers, markdown in zip(groups, markdowns):
         if markdown is None:
-            chunks.append(f"<!-- Page {number} failed after {RETRIES} attempts. -->")
+            chunks.append(
+                f"<!-- {page_group_label(numbers)} failed after {RETRIES} attempts. -->"
+            )
             continue
         text = PAGE_SEPARATOR_RE.sub("", markdown.read_text(encoding="utf-8")).strip()
 
@@ -1680,10 +2393,12 @@ def build_document_metadata(
     markdowns: list[Path | None],
     image_map: dict[Path, str],
     page_numbers: list[int] | None = None,
+    grouped_page_numbers: list[list[int]] | None = None,
 ) -> dict:
     pages = []
     marker_summaries = []
     page_numbers = page_numbers or list(range(1, len(markdowns) + 1))
+    groups = grouped_page_numbers or [[number] for number in page_numbers]
     for source_index, markdown in enumerate(markdowns):
         if markdown is None:
             continue
@@ -1691,10 +2406,16 @@ def build_document_metadata(
         marker_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         structured = marker_metadata.pop("structured_document")
         marker_summaries.append(marker_metadata)
-        for page in structured.get("pages", []):
+        structured_pages = structured.get("pages", [])
+        if processing_mode == "page" and len(structured_pages) != len(groups[source_index]):
+            raise RuntimeError(
+                f"Marker returned metadata for {len(structured_pages)} page(s); "
+                f"expected {len(groups[source_index])}"
+            )
+        for page_index, page in enumerate(structured_pages):
             old_page_id = page.get("page_id", 0)
             new_page_id = (
-                page_numbers[source_index] - 1
+                groups[source_index][page_index] - 1
                 if processing_mode == "page" else len(pages)
             )
             page["source_page_id"] = old_page_id
@@ -1918,7 +2639,7 @@ def process_page_by_page(
     source: Path,
     output_dir: Path,
     marker_version: str,
-    gpu_layers: int,
+    gpu_layers: int | str,
     marker1_offload: bool,
     marker1_recognition_batch_size: int,
     keep_intermediate_files: bool,
@@ -1926,21 +2647,25 @@ def process_page_by_page(
     create_metadata: bool = True,
     page_selection: str | None = None,
     work_dir: Path | None = None,
+    pages_per_process: int = 1,
+    progress_callback=None,
 ) -> list[int]:
     work_dir = work_dir or document_work_dir(source, output_dir)
     if not create_metadata:
         remove_metadata_files(work_dir)
     input_pdf = prepare_input_pdf(source, work_dir)
-    page_count = len(PdfReader(str(input_pdf)).pages)
+    page_count = qpdf_page_count(input_pdf)
     split_dir = work_dir / "split_pages"
     page_output = work_dir / "page_markdown"
     page_output.mkdir(parents=True, exist_ok=True)
     split_pages = split_pdf(input_pdf, split_dir, page_count)
     selected_numbers = parse_page_selection(page_selection, page_count)
+    groups = page_groups(selected_numbers, pages_per_process)
 
     REPORTER.message(
         f"Pages: {page_count} | Marker {marker_version} | Page by page"
         + (f" | Selected: {len(selected_numbers)}" if page_selection else "")
+        + f" | Pages per process: {pages_per_process}"
         + (
             f" | Recognition batch: {marker1_recognition_batch_size}"
             if marker_version == "1.10" else ""
@@ -1948,76 +2673,182 @@ def process_page_by_page(
     )
     results = []
     progress_started = time.monotonic()
-    for position, number in enumerate(selected_numbers, 1):
-        page = split_pages[number - 1]
-        page_dir = page_output / f"page{number:04}"
+    group_pdf_dir = work_dir / "page_groups"
+    completed_pages = 0
+    group_durations = {}
+    group_checkpoints = {
+        tuple(numbers): completed_markdown(
+            page_output / page_group_name(numbers), create_metadata
+        ) is not None
+        for numbers in groups
+    }
+    timed_total = sum(
+        len(numbers)
+        for numbers in groups
+        if not group_checkpoints[tuple(numbers)]
+    )
+
+    def report_group_progress(
+        event: str,
+        numbers: list[int],
+        phase: str,
+        completed: int,
+        *,
+        status: str | None = None,
+        duration_seconds: float | None = None,
+        total_duration_seconds: float | None = None,
+    ) -> None:
+        if progress_callback is None:
+            return
+        record = {
+            "type": "page_progress",
+            "event": event,
+            "row_id": f"{source.resolve()}::{page_group_name(numbers)}",
+            "source": str(source),
+            "label": page_group_label(numbers),
+            "pages": numbers,
+            "phase": phase,
+            "current": completed + len(numbers),
+            "completed": completed,
+            "total": len(selected_numbers),
+        }
+        if phase == "processing":
+            record["resumed"] = group_checkpoints[tuple(numbers)]
+            record["timed_total"] = timed_total
+        if status is not None:
+            record["status"] = status
+        if duration_seconds is not None:
+            record["duration_seconds"] = round(duration_seconds, 3)
+        if total_duration_seconds is not None:
+            record["total_duration_seconds"] = round(total_duration_seconds, 3)
+        progress_callback(record)
+
+    for numbers in groups:
+        group_started = time.monotonic()
+        group_dir = page_output / page_group_name(numbers)
+        label = page_group_label(numbers)
+        checkpoint = group_checkpoints[tuple(numbers)]
         REPORTER.progress(
-            position,
+            completed_pages + len(numbers),
             len(selected_numbers),
-            f"Page {number}: "
-            + ("checkpoint" if completed_markdown(page_dir, create_metadata) else "processing"),
+            f"{label}: " + ("checkpoint" if checkpoint else "processing"),
             progress_started,
         )
-        results.append(
-            convert_input(
-                page, page_dir, marker_version, gpu_layers, marker1_offload,
+        report_group_progress(
+            "started", numbers, "processing", completed_pages,
+            status="checkpoint" if checkpoint else "processing",
+        )
+        try:
+            group_input = create_page_group(split_pages, numbers, group_pdf_dir)
+            result = convert_input(
+                group_input, group_dir, marker_version, gpu_layers, marker1_offload,
                 marker1_recognition_batch_size, create_metadata,
                 source.suffix.lower() in MARKER2_IMAGE_EXTENSIONS,
             )
+        except Exception:
+            duration = time.monotonic() - group_started
+            report_group_progress(
+                "finished", numbers, "processing", completed_pages,
+                status="failed", duration_seconds=duration,
+                total_duration_seconds=duration,
+            )
+            raise
+        duration = time.monotonic() - group_started
+        group_durations[tuple(numbers)] = duration
+        results.append(result)
+        report_group_progress(
+            "finished", numbers, "processing", completed_pages,
+            status="success" if result is not None else "failed",
+            duration_seconds=duration,
+            total_duration_seconds=duration,
         )
+        completed_pages += len(numbers)
     REPORTER.finish_progress()
 
     final_md = output_dir / f"{source.stem}.md"
     image_map = copy_markdown_and_images(
-        results, final_md, page_numbers=selected_numbers
+        results, final_md, grouped_page_numbers=groups
     )
     metadata = None
     if create_metadata:
         metadata = build_document_metadata(
-            source, marker_version, "page", results, image_map, selected_numbers
+            source, marker_version, "page", results, image_map,
+            grouped_page_numbers=groups,
         )
         write_work_metadata(work_dir, metadata)
     failed = [
-        number for number, result in zip(selected_numbers, results) if result is None
+        number
+        for numbers, result in zip(groups, results)
+        if result is None
+        for number in numbers
     ]
     if llm_refinement and not failed:
         refined_pages = []
         qwen_server = QwenServer()
         try:
-            for position, (number, markdown) in enumerate(
-                zip(selected_numbers, results), 1
+            refined_pages_completed = 0
+            for position, (numbers, markdown) in enumerate(
+                zip(groups, results), 1
             ):
                 if markdown is None:
                     refined_pages.append(None)
                     continue
+                group_started = time.monotonic()
                 REPORTER.progress(
                     position,
-                    len(selected_numbers),
-                    f"Page {number}: refining",
+                    len(groups),
+                    f"{page_group_label(numbers)}: refining",
                     progress_started,
                 )
-                marker_metadata = json.loads(
-                    metadata_for(markdown).read_text(encoding="utf-8")
+                report_group_progress(
+                    "started", numbers, "refining", refined_pages_completed,
+                    status="refining",
                 )
-                page_metadata = {
-                    "pages": marker_metadata["structured_document"].get("pages", [])
-                }
-                for page in page_metadata["pages"]:
-                    page["page_id"] = number - 1
-                refined_pages.append(
-                    refine_markdown_with_qwen(
+                try:
+                    marker_metadata = json.loads(
+                        metadata_for(markdown).read_text(encoding="utf-8")
+                    )
+                    page_metadata = {
+                        "pages": marker_metadata["structured_document"].get("pages", [])
+                    }
+                    if len(page_metadata["pages"]) != len(numbers):
+                        raise RuntimeError(
+                            f"Marker returned metadata for {len(page_metadata['pages'])} "
+                            f"page(s); expected {len(numbers)}"
+                        )
+                    for page, number in zip(page_metadata["pages"], numbers):
+                        page["page_id"] = number - 1
+                    refined = refine_markdown_with_qwen(
                         markdown,
                         page_metadata,
-                        work_dir / "qwen_pages" / f"page{number:04}.md",
+                        work_dir / "qwen_pages" / f"{page_group_name(numbers)}.md",
                         qwen_server,
                     )
+                except Exception:
+                    duration = time.monotonic() - group_started
+                    total_duration = group_durations[tuple(numbers)] + duration
+                    report_group_progress(
+                        "finished", numbers, "refining", refined_pages_completed,
+                        status="failed", duration_seconds=duration,
+                        total_duration_seconds=total_duration,
+                    )
+                    raise
+                duration = time.monotonic() - group_started
+                group_durations[tuple(numbers)] += duration
+                refined_pages.append(refined)
+                report_group_progress(
+                    "finished", numbers, "refining", refined_pages_completed,
+                    status="success", duration_seconds=duration,
+                    total_duration_seconds=group_durations[tuple(numbers)],
                 )
+                refined_pages_completed += len(numbers)
         finally:
             qwen_server.close()
             REPORTER.finish_progress()
         refined_md = output_dir / f"{source.stem}.refined.md"
         copy_markdown_and_images(
-            refined_pages, refined_md, image_map, selected_numbers
+            refined_pages, refined_md, image_map,
+            grouped_page_numbers=groups,
         )
         REPORTER.message(f"Refined: {refined_md.name}")
     if not failed and not keep_intermediate_files:
@@ -2026,8 +2857,15 @@ def process_page_by_page(
         f"Created: {final_md.name} "
         f"({len(selected_numbers) - len(failed)}/{len(selected_numbers)} selected pages)"
     )
+    failed_set = set(failed)
+    completed = [number for number in selected_numbers if number not in failed_set]
+    REPORTER.message(
+        format_page_summary("Completed", completed, len(selected_numbers))
+    )
     if failed:
-        REPORTER.message(f"Failed pages: {failed}", "warning")
+        REPORTER.message(
+            format_page_summary("Failed", failed, len(selected_numbers)), "warning"
+        )
         REPORTER.message(f"Intermediate data retained: {work_dir}")
     elif keep_intermediate_files:
         REPORTER.message(f"Intermediate data retained: {work_dir}")
@@ -2038,7 +2876,7 @@ def process_whole_document(
     source: Path,
     output_dir: Path,
     marker_version: str,
-    gpu_layers: int,
+    gpu_layers: int | str,
     marker1_offload: bool,
     marker1_recognition_batch_size: int,
     keep_intermediate_files: bool,
@@ -2052,7 +2890,7 @@ def process_whole_document(
     checkpoint_dir = work_dir / "whole_document"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     input_pdf = prepare_input_pdf(source, work_dir)
-    page_count = len(PdfReader(str(input_pdf)).pages)
+    page_count = qpdf_page_count(input_pdf)
     REPORTER.message(
         f"Marker {marker_version} | Whole document | Up to {RETRIES} attempts"
     )
@@ -2549,6 +3387,9 @@ and MARKER_GUI_PYTHON.
         "--jsonl", action="store_true",
         help="write one JSON result per line to stdout",
     )
+    output.add_argument(
+        "--gui-events", action="store_true", help=argparse.SUPPRESS,
+    )
 
     diagnostics = parser.add_argument_group("progress and diagnostics")
     verbosity = diagnostics.add_mutually_exclusive_group()
@@ -2575,8 +3416,8 @@ and MARKER_GUI_PYTHON.
 
     tuning = parser.add_argument_group("advanced tuning")
     tuning.add_argument(
-        "--gpu-layers", type=int, metavar="N",
-        help="Marker 2 llama.cpp GPU layers (default: 30)",
+        "--gpu-layers", type=gpu_layers_argument, metavar="AUTO|ALL|N",
+        help="Marker 2 GPU layers (default: auto; manual numbers are preflighted)",
     )
     tuning.add_argument(
         "--marker1-no-offload", action="store_true",
@@ -2585,6 +3426,10 @@ and MARKER_GUI_PYTHON.
     tuning.add_argument(
         "--marker1-recognition-batch-size", type=int, metavar="N",
         help="Marker 1 recognition batch size (default: 1)",
+    )
+    tuning.add_argument(
+        "--pages-per-process", type=int, default=1, metavar="N",
+        help="pages handled by each Marker process in page mode (default: 1)",
     )
 
     operation = parser.add_argument_group("operation")
@@ -2621,7 +3466,8 @@ def required_runtime_files(
         (
             "Marker executable",
             MARKER_110 if marker_version == "1.10" else MARKER_200,
-        )
+        ),
+        ("qpdf", QPDF),
     ]
     if marker_version == "1.10":
         required.append(("Marker 1 Python", MARKER1_PYTHON))
@@ -2633,8 +3479,6 @@ def required_runtime_files(
                 ("Surya projector", SURYA_MMPROJ),
             ]
         )
-    if processing_mode == "page":
-        required.append(("qpdf", QPDF))
     if llm_refinement:
         required.extend(
             [("llama.cpp server", LLAMA_SERVER), ("Qwen model", QWEN_MODEL)]
@@ -2822,12 +3666,13 @@ def build_run_manifest(
     source: Path,
     marker_version: str,
     processing_mode: str,
-    gpu_layers: int,
+    gpu_layers: int | str,
     marker1_offload: bool,
     marker1_recognition_batch_size: int,
     llm_refinement: bool,
     create_metadata: bool,
     page_selection: str | None = None,
+    pages_per_process: int = 1,
 ) -> dict:
     runtime = {
         label: file_identity(path)
@@ -2853,6 +3698,7 @@ def build_run_manifest(
             "marker_version": marker_version,
             "processing_mode": processing_mode,
             "page_selection": page_selection if processing_mode == "page" else None,
+            "pages_per_process": pages_per_process if processing_mode == "page" else None,
             "gpu_layers": gpu_layers if marker_version == "2.0" else None,
             "marker1_offload": marker1_offload if marker_version == "1.10" else None,
             "marker1_recognition_batch_size": (
@@ -3001,22 +3847,407 @@ def prepare_document_state(
     return work_dir
 
 
+def check_nvidia_gpu() -> tuple[str, dict]:
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.total,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("The NVIDIA driver could not be reached.") from exc
+    first_line = next((line.strip() for line in result.stdout.splitlines() if line.strip()), "")
+    fields = [field.strip() for field in first_line.rsplit(",", 2)]
+    if result.returncode or len(fields) != 3:
+        raise RuntimeError("No NVIDIA GPU was reported by the driver.")
+    try:
+        total_mib, free_mib = int(fields[1]), int(fields[2])
+    except ValueError as exc:
+        raise RuntimeError("The NVIDIA driver returned unreadable memory information.") from exc
+    value = {
+        "name": fields[0],
+        "memory_total_mib": total_mib,
+        "memory_free_mib": free_mib,
+    }
+    return (
+        f"{fields[0]} — {free_mib:,} MiB free of {total_mib:,} MiB",
+        value,
+    )
+
+
+def check_qpdf_runtime() -> tuple[str, None]:
+    if not QPDF.is_file():
+        raise RuntimeError(f"qpdf was not found: {QPDF}")
+    result = subprocess.run(
+        [str(QPDF), "--version"], capture_output=True, text=True,
+        check=False, timeout=30,
+    )
+    if result.returncode:
+        raise RuntimeError("qpdf could not be started.")
+    version = next((line.strip() for line in result.stdout.splitlines() if line.strip()), "qpdf ready")
+    return f"{version} — {QPDF}", None
+
+
+def check_runtime_file(label: str, path: Path) -> tuple[str, None]:
+    if not path.is_file():
+        raise RuntimeError(f"{label} was not found: {path}")
+    return str(path), None
+
+
+def check_marker1_cuda() -> tuple[str, None]:
+    result = subprocess.run(
+        [
+            str(MARKER1_PYTHON), "-c",
+            "import sys, torch; sys.exit(0 if torch.cuda.is_available() "
+            "and torch.cuda.device_count() else 1)",
+        ],
+        capture_output=True, text=True, check=False, timeout=90,
+    )
+    if result.returncode:
+        raise RuntimeError("Marker 1's PyTorch environment cannot initialize CUDA.")
+    return "PyTorch can use the NVIDIA GPU", None
+
+
+def check_llama_cuda() -> tuple[str, None]:
+    result = subprocess.run(
+        [str(LLAMA_SERVER), "--list-devices"], capture_output=True,
+        text=True, check=False, timeout=30,
+    )
+    devices = result.stdout + result.stderr
+    if result.returncode or "CUDA" not in devices.upper():
+        raise RuntimeError("llama.cpp cannot find a CUDA device.")
+    device_line = next(
+        (line.strip() for line in devices.splitlines() if "CUDA" in line.upper()),
+        "llama.cpp can use CUDA",
+    )
+    return device_line, None
+
+
+def _read_probe_log(log_file) -> str:
+    log_file.flush()
+    log_file.seek(0)
+    return log_file.read().decode("utf-8", errors="replace")
+
+
+def probe_surya_gpu_fit(gpu_layers: int | str) -> tuple[str, dict]:
+    requested = normalize_gpu_layers(gpu_layers)
+    api_key = secrets.token_urlsafe(24)
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    command = [
+        str(LLAMA_SERVER),
+        "-lv", "4",
+        "-m", str(SURYA_MODEL),
+        "--mmproj", str(SURYA_MMPROJ),
+        "-ngl", str(requested),
+        "--fit", "on" if requested == "auto" else "off",
+        "--host", "127.0.0.1",
+        "--port", str(port),
+        "--parallel", "1",
+        "--ctx-size", "16384",
+        "--threads", "4",
+        "--threads-batch", "4",
+        "--load-mode", "none",
+        "--alias", "surya-runtime-check",
+        "--api-key", api_key,
+        "--jinja",
+        "--no-warmup",
+        "--no-webui",
+    ]
+    process = None
+    log_text = ""
+    with tempfile.TemporaryFile(mode="w+b") as log_file:
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                creationflags=(
+                    subprocess.BELOW_NORMAL_PRIORITY_CLASS
+                    | subprocess.CREATE_NEW_PROCESS_GROUP
+                    if os.name == "nt" else 0
+                ),
+                start_new_session=os.name != "nt",
+            )
+            deadline = time.monotonic() + 180
+            url = f"http://127.0.0.1:{port}/health"
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    log_text = _read_probe_log(log_file)
+                    break
+                try:
+                    request = urllib.request.Request(
+                        url, headers={"Authorization": f"Bearer {api_key}"}
+                    )
+                    with urllib.request.urlopen(request, timeout=1) as response:
+                        if response.status == 200:
+                            time.sleep(0.2)
+                            log_text = _read_probe_log(log_file)
+                            break
+                except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+                    pass
+                time.sleep(0.5)
+            else:
+                log_text = _read_probe_log(log_file)
+                raise RuntimeError("The Surya model did not finish loading within 180 seconds.")
+            if process.poll() is not None:
+                useful = [line.strip() for line in log_text.splitlines() if line.strip()][-8:]
+                reason = next(
+                    (line for line in reversed(useful) if re.search(r"out of memory|failed|error", line, re.I)),
+                    useful[-1] if useful else "llama.cpp stopped while loading the model",
+                )
+                raise RuntimeError(
+                    f"GPU layers {requested} could not safely load the Surya model. "
+                    f"Choose Auto or a lower number. {reason}"
+                )
+        finally:
+            if process is not None and process.poll() is None:
+                stop_process_tree(process, graceful=True)
+
+    offload_match = re.search(
+        r"offloaded\s+(\d+)\s*/\s*(\d+)\s+layers", log_text, re.I
+    )
+    if offload_match:
+        resolved_layers = int(offload_match.group(1))
+        model_layers = int(offload_match.group(2))
+    else:
+        offload_match = re.search(
+            r"offloading\s+(\d+)\s+(?:repeating\s+)?layers", log_text, re.I
+        )
+        model_match = re.search(r"n_layer\s*=\s*(\d+)", log_text, re.I)
+        resolved_layers = int(offload_match.group(1)) if offload_match else 0
+        model_layers = int(model_match.group(1)) if model_match else None
+    if requested in {"auto", "all"} and resolved_layers < 1:
+        raise RuntimeError(
+            "The model loaded, but its safe GPU-layer count could not be read. "
+            "Conversion was stopped instead of guessing."
+        )
+    if isinstance(requested, int):
+        resolved_layers = min(requested, model_layers) if model_layers else requested
+    if resolved_layers < 1:
+        raise RuntimeError("The Surya model would not use the GPU.")
+    if requested == "auto":
+        detail = f"Auto selected {resolved_layers} GPU layers"
+    elif requested == "all":
+        detail = f"All available model layers loaded safely ({resolved_layers})"
+    elif model_layers and requested > model_layers:
+        detail = f"Model has {model_layers} layers; {model_layers} will be used safely"
+    else:
+        detail = f"{resolved_layers} GPU layers loaded safely"
+    return detail, {
+        "requested": requested,
+        "resolved_gpu_layers": resolved_layers,
+        "model_layers": model_layers,
+    }
+
+
+def load_runtime_component_cache() -> tuple[dict, bool]:
+    raw_cache = os.environ.pop(RUNTIME_CHECK_CACHE_ENV, "")
+    force = os.environ.pop(RUNTIME_CHECK_FORCE_ENV, "") == "1"
+    try:
+        cache = json.loads(raw_cache) if raw_cache else {"components": {}}
+    except (TypeError, json.JSONDecodeError):
+        cache = {"components": {}}
+    if not isinstance(cache, dict) or not isinstance(cache.get("components"), dict):
+        cache = {"components": {}}
+    return cache, force
+
+
 def check_runtime(
     marker_version: str,
     processing_mode: str,
-    gpu_layers: int,
+    gpu_layers: int | str,
     llm_refinement: bool,
-) -> str:
-    missing = [
-        f"{label}: {path}"
-        for label, path in required_runtime_files(
-            marker_version, processing_mode, llm_refinement
+) -> dict:
+    del processing_mode  # Runtime components do not change between page modes.
+    cache, force = load_runtime_component_cache()
+    cached_components = cache["components"]
+    components = []
+    gpu_value = None
+    resolved_gpu_layers: int | str = gpu_layers
+    now = time.time()
+
+    def ensure(
+        key: str,
+        label: str,
+        fingerprint: object,
+        checker,
+        ttl: int = RUNTIME_CHECK_CACHE_SECONDS,
+        value_validator=None,
+    ):
+        entry = cached_components.get(key)
+        reusable = False
+        if not force and isinstance(entry, dict):
+            try:
+                checked_at = float(entry["checked_at"])
+                reusable = (
+                    entry.get("fingerprint") == fingerprint
+                    and 0 <= now - checked_at <= ttl
+                    and isinstance(entry.get("detail"), str)
+                    and (
+                        value_validator is None
+                        or value_validator(entry.get("value"))
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                reusable = False
+        if reusable:
+            detail = entry["detail"]
+            value = entry.get("value")
+        else:
+            try:
+                detail, value = checker()
+            except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError) as exc:
+                components.append({
+                    "key": key, "label": label, "status": "error",
+                    "detail": str(exc), "cached": False,
+                })
+                raise
+            entry = {
+                "fingerprint": fingerprint,
+                "checked_at": now,
+                "detail": detail,
+                "value": value,
+            }
+            cached_components[key] = entry
+        components.append({
+            "key": key, "label": label, "status": "ready",
+            "detail": detail, "cached": reusable,
+        })
+        return value
+
+    try:
+        ensure("qpdf", "qpdf", file_identity(QPDF), check_qpdf_runtime)
+        gpu_value = ensure(
+            "nvidia_gpu", "Graphics card", {"command": "nvidia-smi-v2"},
+            check_nvidia_gpu, GPU_STATUS_CACHE_SECONDS,
+            lambda value: (
+                isinstance(value, dict)
+                and isinstance(value.get("name"), str)
+                and isinstance(value.get("memory_free_mib"), int)
+            ),
         )
-        if not path.is_file()
-    ]
-    if missing:
-        raise RuntimeError("Missing required runtime files:\n  " + "\n  ".join(missing))
-    return verify_gpu(marker_version, gpu_layers, llm_refinement)
+        marker_path = MARKER_110 if marker_version == "1.10" else MARKER_200
+        ensure(
+            f"marker_{marker_version}", "Marker executable",
+            file_identity(marker_path),
+            lambda: check_runtime_file("Marker executable", marker_path),
+        )
+        if marker_version == "1.10":
+            ensure(
+                "marker1_python", "Marker 1 Python", file_identity(MARKER1_PYTHON),
+                lambda: check_runtime_file("Marker 1 Python", MARKER1_PYTHON),
+            )
+            ensure(
+                "marker1_cuda", "Marker 1 GPU support",
+                {"python": file_identity(MARKER1_PYTHON), "gpu": gpu_value.get("name")},
+                check_marker1_cuda,
+            )
+        else:
+            ensure(
+                "llama_binary", "llama.cpp server", file_identity(LLAMA_SERVER),
+                lambda: check_runtime_file("llama.cpp server", LLAMA_SERVER),
+            )
+            ensure(
+                "llama_cuda", "llama.cpp GPU support",
+                {"binary": file_identity(LLAMA_SERVER), "gpu": gpu_value.get("name")},
+                check_llama_cuda,
+            )
+            ensure(
+                "surya_model", "Surya model", file_identity(SURYA_MODEL),
+                lambda: check_runtime_file("Surya model", SURYA_MODEL),
+            )
+            ensure(
+                "surya_projector", "Surya projector", file_identity(SURYA_MMPROJ),
+                lambda: check_runtime_file("Surya projector", SURYA_MMPROJ),
+            )
+            free_bucket = int(gpu_value.get("memory_free_mib", 0)) // 256 * 256
+            fit_value = ensure(
+                "surya_gpu_fit", "Surya GPU memory test",
+                {
+                    "binary": file_identity(LLAMA_SERVER),
+                    "model": file_identity(SURYA_MODEL),
+                    "projector": file_identity(SURYA_MMPROJ),
+                    "gpu": gpu_value.get("name"),
+                    "free_memory_bucket_mib": free_bucket,
+                    "gpu_layers": gpu_layers,
+                    "context_size": 16384,
+                },
+                lambda: probe_surya_gpu_fit(gpu_layers),
+                GPU_FIT_CACHE_SECONDS,
+                lambda value: (
+                    isinstance(value, dict)
+                    and isinstance(value.get("resolved_gpu_layers"), int)
+                    and value["resolved_gpu_layers"] > 0
+                ),
+            )
+            resolved_gpu_layers = fit_value["resolved_gpu_layers"]
+        if llm_refinement:
+            ensure(
+                "qwen_model", "Qwen model", file_identity(QWEN_MODEL),
+                lambda: check_runtime_file("Qwen model", QWEN_MODEL),
+            )
+            if marker_version == "1.10":
+                ensure(
+                    "llama_binary", "llama.cpp server", file_identity(LLAMA_SERVER),
+                    lambda: check_runtime_file("llama.cpp server", LLAMA_SERVER),
+                )
+                ensure(
+                    "llama_cuda", "llama.cpp GPU support",
+                    {"binary": file_identity(LLAMA_SERVER), "gpu": gpu_value.get("name")},
+                    check_llama_cuda,
+                )
+    except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError) as exc:
+        return {
+            "status": "error", "error": str(exc), "components": components,
+            "cache": cache, "gpu": (gpu_value or {}).get("name", ""),
+            "cached": False,
+        }
+    return {
+        "status": "ready",
+        "components": components,
+        "cache": cache,
+        "gpu": (gpu_value or {}).get("name", ""),
+        "resolved_gpu_layers": resolved_gpu_layers,
+        "cached": bool(components) and all(item.get("cached") for item in components),
+    }
+
+
+def runtime_check_signature(
+    marker_version: str,
+    processing_mode: str,
+    gpu_layers: int | str,
+    llm_refinement: bool,
+) -> dict:
+    del processing_mode
+    return {
+        "marker_version": marker_version,
+        "gpu_layers": gpu_layers if marker_version == "2.0" else None,
+        "llm_refinement": llm_refinement,
+    }
+
+
+def normalized_runtime_check_result(value: object, gpu_layers: int | str) -> dict:
+    """Accept the former internal GPU-name result for integrations during migration."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        return {
+            "status": "ready", "gpu": value.strip(), "components": [],
+            "cache": {"components": {}}, "resolved_gpu_layers": gpu_layers,
+            "cached": False,
+        }
+    return {
+        "status": "error", "error": "Runtime check returned an invalid result.",
+        "components": [], "cache": {"components": {}}, "cached": False,
+    }
 
 
 def print_dry_run(
@@ -3029,6 +4260,7 @@ def print_dry_run(
     processing_mode: str,
     restart: bool,
     page_selection: str | None = None,
+    pages_per_process: int = 1,
     jsonl: bool = False,
 ) -> None:
     if jsonl:
@@ -3037,6 +4269,7 @@ def print_dry_run(
                 "type": "plan", "source": str(path), "status": "selected",
                 "engine": f"marker{marker_version[0]}",
                 "mode": processing_mode, "pages": page_selection,
+                "pages_per_process": pages_per_process,
                 "output": str(output_dir / f"{path.stem}.md"),
             })
         for paths in conflicts:
@@ -3059,6 +4292,8 @@ def print_dry_run(
     print(f"Mode: {processing_mode}")
     if page_selection:
         print(f"Pages: {page_selection}")
+    if processing_mode == "page":
+        print(f"Pages per process: {pages_per_process}")
     print(f"Restart: {'yes' if restart else 'no'}")
     print(f"Selected ({len(inputs)}):")
     for path in inputs:
@@ -3077,12 +4312,17 @@ def emit_json(value: dict) -> None:
     print(json.dumps(value, ensure_ascii=False, separators=(",", ":")), flush=True)
 
 
+def emit_gui_event(value: dict) -> None:
+    payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    print(GUI_EVENT_PREFIX + payload, file=sys.stderr, flush=True)
+
+
 def build_resume_arguments(
     input_paths: list[Path],
     output_dir: Path,
     engine: str,
     args: argparse.Namespace,
-    gpu_layers: int,
+    gpu_layers: int | str,
     recognition_batch_size: int,
 ) -> list[str]:
     arguments = [
@@ -3093,6 +4333,8 @@ def build_resume_arguments(
     ]
     if args.pages:
         arguments.extend(["--pages", args.pages])
+    if args.processing_mode == "page":
+        arguments.extend(["--pages-per-process", str(args.pages_per_process)])
     for pattern in args.include_patterns or []:
         arguments.extend(["--include", pattern])
     for pattern in args.exclude_patterns or []:
@@ -3172,6 +4414,10 @@ def arguments_from_manifest(manifest: dict, work_dir: Path) -> list[str]:
     ]
     if settings.get("page_selection"):
         arguments.extend(["--pages", settings["page_selection"]])
+    if settings.get("processing_mode") == "page":
+        arguments.extend([
+            "--pages-per-process", str(settings.get("pages_per_process") or 1)
+        ])
     if not settings.get("create_metadata", True):
         arguments.append("--no-metadata")
     if settings.get("llm_refinement"):
@@ -3184,7 +4430,7 @@ def arguments_from_manifest(manifest: dict, work_dir: Path) -> list[str]:
         if not settings.get("marker1_offload", True):
             arguments.append("--marker1-no-offload")
     else:
-        arguments.extend(["--gpu-layers", str(settings.get("gpu_layers") or 30)])
+        arguments.extend(["--gpu-layers", str(settings.get("gpu_layers") or "auto")])
     return arguments
 
 
@@ -3289,6 +4535,7 @@ def main(argv: list[str] | None = None) -> int:
             or args.llm_refinement or args.gpu_layers is not None
             or args.marker1_no_offload
             or args.marker1_recognition_batch_size is not None
+            or args.pages_per_process != 1
             or args.resume_settings == "current"
         ):
             parser.error(
@@ -3336,12 +4583,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--marker1-no-offload only applies to Marker 1")
     if marker_version == "2.0" and args.marker1_recognition_batch_size is not None:
         parser.error("--marker1-recognition-batch-size only applies to Marker 1")
-    gpu_layers = 30 if args.gpu_layers is None else args.gpu_layers
+    gpu_layers = "auto" if args.gpu_layers is None else args.gpu_layers
     recognition_batch_size = args.marker1_recognition_batch_size or 1
-    if marker_version == "2.0" and gpu_layers < 1:
-        parser.error("--gpu-layers must be one or greater for Marker 2")
     if recognition_batch_size < 1:
         parser.error("--marker1-recognition-batch-size must be one or greater")
+    if args.pages_per_process < 1:
+        parser.error("--pages-per-process must be one or greater")
+    if args.processing_mode != "page" and args.pages_per_process != 1:
+        parser.error("--pages-per-process requires --mode page")
     if args.no_metadata and args.llm_refinement:
         parser.error("Qwen refinement requires rich metadata")
     if args.check and args.restart:
@@ -3369,6 +4618,9 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         parser.error(f"cannot open diagnostic log: {exc}")
 
+    if args.gui_events and not args.check and not args.dry_run:
+        write_gui_console_notice()
+
     use_gui = args.gui
     if use_gui:
         if args.source or args.legacy_input or args.dry_run or args.check:
@@ -3390,28 +4642,27 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check:
         try:
-            gpu_name = check_runtime(
-                marker_version, args.processing_mode, gpu_layers, args.llm_refinement
+            runtime_check = normalized_runtime_check_result(
+                check_runtime(
+                    marker_version, args.processing_mode, gpu_layers,
+                    args.llm_refinement,
+                ),
+                gpu_layers,
             )
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
-            REPORTER.message(f"Check failed: {exc}", "error")
-            if args.jsonl:
-                emit_json({"type": "check", "status": "error", "error": str(exc)})
-            return 2
-        runtime = {
-            label: str(path) for label, path in required_runtime_files(
-                marker_version, args.processing_mode, args.llm_refinement
-            )
-        }
+            runtime_check = {
+                "status": "error", "error": str(exc), "components": [],
+                "cache": {"components": {}},
+            }
         if args.jsonl:
-            emit_json({
-                "type": "check", "status": "ready", "engine": engine,
-                "gpu": gpu_name, "runtime": runtime,
-            })
+            emit_json({"type": "check", "engine": engine, **runtime_check})
         else:
-            print(f"Ready: Marker {marker_version} on {gpu_name}")
-            for label, path in runtime.items():
-                print(f"  {label}: {path}")
+            for _summary_status, summary in format_runtime_check_summaries(
+                runtime_check
+            ):
+                print(summary)
+        if runtime_check.get("status") != "ready":
+            return 2
         return 0
 
     assert input_paths and output_dir is not None
@@ -3441,21 +4692,33 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         print_dry_run(
             input_paths, output_dir, inputs, unsupported, conflicts,
-            marker_version, args.processing_mode, args.restart, args.pages, args.jsonl,
+            marker_version, args.processing_mode, args.restart, args.pages,
+            args.pages_per_process, args.jsonl,
         )
         return 1 if conflicts or not inputs else 0
     if not inputs and not conflicts:
         parser.error("No supported input files found")
 
     try:
-        gpu_name = check_runtime(
-            marker_version, args.processing_mode, gpu_layers, args.llm_refinement
+        runtime_check = normalized_runtime_check_result(
+            check_runtime(
+                marker_version, args.processing_mode, gpu_layers,
+                args.llm_refinement,
+            ),
+            gpu_layers,
         )
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
-        show_gpu_warning(str(exc), use_gui)
-        if args.jsonl:
-            emit_json({"type": "error", "status": "error", "error": str(exc)})
+        runtime_check = {
+            "status": "error", "error": str(exc), "components": [],
+            "cache": {"components": {}},
+        }
+    if args.jsonl:
+        emit_json({"type": "check", "engine": engine, **runtime_check})
+    if runtime_check.get("status") != "ready":
+        show_gpu_warning(runtime_check.get("error", "Runtime check failed."), use_gui)
         return 2
+    gpu_name = runtime_check["gpu"]
+    effective_gpu_layers = runtime_check.get("resolved_gpu_layers", gpu_layers)
 
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -3495,6 +4758,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.llm_refinement,
                     not args.no_metadata,
                     args.pages,
+                    args.pages_per_process,
                 )
                 manifest["resume_arguments"] = build_resume_arguments(
                     [source], output_dir, engine, args, gpu_layers,
@@ -3507,7 +4771,7 @@ def main(argv: list[str] | None = None) -> int:
                 REPORTER.message("Resume available: marker --resume", "verbose")
                 if args.processing_mode == "page":
                     failed_pages = process_page_by_page(
-                        source, output_dir, marker_version, gpu_layers,
+                        source, output_dir, marker_version, effective_gpu_layers,
                         not args.marker1_no_offload,
                         recognition_batch_size,
                         args.keep_intermediate_files,
@@ -3515,6 +4779,8 @@ def main(argv: list[str] | None = None) -> int:
                         create_metadata=not args.no_metadata,
                         page_selection=args.pages,
                         work_dir=work_dir,
+                        pages_per_process=args.pages_per_process,
+                        progress_callback=emit_gui_event if args.gui_events else None,
                     )
                     outputs = [output_dir / f"{source.stem}.md"]
                     if failed_pages:
@@ -3525,7 +4791,7 @@ def main(argv: list[str] | None = None) -> int:
                         status = "success"
                 else:
                     converted = process_whole_document(
-                        source, output_dir, marker_version, gpu_layers,
+                        source, output_dir, marker_version, effective_gpu_layers,
                         not args.marker1_no_offload,
                         recognition_batch_size,
                         args.keep_intermediate_files,
@@ -3556,6 +4822,7 @@ def main(argv: list[str] | None = None) -> int:
                     "outputs": [str(path) for path in outputs],
                     "failed_pages": failed_pages, "engine": engine,
                     "mode": args.processing_mode,
+                    "pages_per_process": args.pages_per_process,
                     "elapsed_seconds": round(time.monotonic() - document_started, 3),
                 }
                 if status == "failed":
@@ -3569,7 +4836,7 @@ def main(argv: list[str] | None = None) -> int:
                 failed_documents.append(source)
                 if source.suffix.lower() == ".pdf":
                     try:
-                        pending_pages += len(PdfReader(str(source)).pages)
+                        pending_pages += qpdf_page_count(source)
                     except Exception:
                         pass
                 REPORTER.message(f"Failed document: {exc}", "error")

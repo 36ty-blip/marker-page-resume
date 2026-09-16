@@ -12,6 +12,7 @@ checkpoints, and the tutorial run locally.
 
 - Marker 1.10 and Marker 2 execution paths
 - Page-by-page or whole-document conversion
+- Adjustable pages per Marker process, with grouped checkpoints
 - Safe interruption and per-document resume
 - Resume using saved settings or compatible new settings
 - Multiple files and folders, recursive discovery, and include/exclude filters
@@ -19,7 +20,10 @@ checkpoints, and the tutorial run locally.
 - TTY-aware progress plus quiet, verbose, and debug modes
 - Diagnostic logs and JSON Lines results
 - Optional rich structural metadata and local Qwen refinement
-- Tk desktop GUI
+- Tk desktop GUI with an automatic, visible GPU/runtime check
+- Fixed GUI elapsed/ETA display with compact summaries, immediate failures, and verbose timing rows
+- Component-level check reuse: unchanged GPU, qpdf, engine, and model checks are not repeated
+- Automatic Marker 2 GPU-layer selection, with a real model-load safety test
 - Lightweight offline `--tutorial`
 
 ## Requirements
@@ -27,7 +31,7 @@ checkpoints, and the tutorial run locally.
 - Windows 10 or 11
 - Python 3.12 recommended
 - An NVIDIA GPU supported by the selected Marker runtime
-- [qpdf](https://qpdf.sourceforge.io/) for page-by-page processing
+- [qpdf](https://qpdf.sourceforge.io/) for PDF checks, page counts, and splitting
 - Marker and any optional llama.cpp/GGUF models installed locally
 
 The controller contains no model files or third-party executables.
@@ -77,6 +81,15 @@ with `--engine marker1` when needed.
 # Convert selected pages
 .\marker.cmd document.pdf --pages 1-5,8,12-
 
+# Process four pages each time to reduce Marker restarts
+.\marker.cmd document.pdf --pages-per-process 4
+
+# Let Marker Controller select a safe GPU-layer count (the default)
+.\marker.cmd document.pdf --gpu-layers auto
+
+# Advanced: test and use a manual GPU-layer count
+.\marker.cmd document.pdf --gpu-layers 20
+
 # Convert multiple PDFs
 .\marker.cmd first.pdf second.pdf -o converted
 
@@ -95,6 +108,20 @@ Use `--dry-run` to inspect file selection without starting conversion:
 ```powershell
 .\marker.cmd documents -o converted --recursive --dry-run
 ```
+
+The GUI recommends `Auto` for Marker 2. Before conversion, the controller
+briefly loads the Surya model with the current context and GPU setting. `Auto`
+uses llama.cpp's memory fitting and records the layer count it selected. A
+manual number or `All` is treated as an advanced setting and must pass the same
+load test; if it does not fit, conversion stops with a suggestion to use Auto
+or a lower number.
+
+Runtime checks are cached separately. Changing GPU layers reruns only the Surya
+memory test, switching engines checks only the newly selected engine parts, and
+enabling Qwen adds only its model and llama.cpp checks. The GUI shows one compact
+`Ready: x/y` line and adds a `Fail: x/y check (...)` line with the exact
+component error only when something fails. The **Check runtime** button forces
+a fresh check of the currently selected components.
 
 ## Offline tutorial
 
@@ -119,10 +146,13 @@ marker_output/
         └── page_markdown/
 ```
 
-Completed compatible pages are reused. Changing batch size, GPU tuning, page
-selection, metadata, or Qwen refinement can retain compatible work. Changing
-the engine or processing mode restarts that document. Changed source contents
-are never combined with stale checkpoints.
+Completed compatible page groups are reused. A group size of `1` provides the
+smallest recovery checkpoints; a larger `--pages-per-process` value reduces
+Marker restarts but uses more memory and repeats the whole group if it fails.
+Changing batch size, GPU tuning, page selection, metadata, Qwen refinement, or
+group size can retain compatible work. Changing the engine or processing mode
+restarts that document. Changed source contents are never combined with stale
+checkpoints.
 
 ## Diagnostics and structured output
 

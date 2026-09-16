@@ -49,6 +49,7 @@ class MarkerProcessTests(unittest.TestCase):
                     str(source), "--output", str(output), "--engine", "marker1",
                     "--refine", "--keep-work",
                     "--marker1-recognition-batch-size", "4",
+                    "--pages-per-process", "3",
                 ])
                 saved = marker.load_active_resume_arguments()
                 second = marker.main(["--resume"])
@@ -60,7 +61,9 @@ class MarkerProcessTests(unittest.TestCase):
             self.assertEqual(
                 saved[saved.index("--marker1-recognition-batch-size") + 1], "4"
             )
+            self.assertEqual(saved[saved.index("--pages-per-process") + 1], "3")
             self.assertEqual(process.call_args.args[5], 4)
+            self.assertEqual(process.call_args.kwargs["pages_per_process"], 3)
             self.assertTrue(process.call_args.kwargs["llm_refinement"])
             self.assertTrue(process.call_args.kwargs["create_metadata"])
 
@@ -95,6 +98,196 @@ class MarkerProcessTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exceeds"):
             marker.parse_page_selection("6", 5)
 
+    def test_page_groups_preserve_selected_order(self):
+        self.assertEqual(
+            marker.page_groups([1, 3, 4, 8, 9], 2),
+            [[1, 3], [4, 8], [9]],
+        )
+
+    def test_create_page_group_combines_pages_with_qpdf(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            split_pages = [root / "page-1.pdf", root / "page-2.pdf"]
+
+            def fake_run(command, **_kwargs):
+                Path(command[-1]).write_bytes(b"combined")
+                return CompletedProcess(command, 0)
+
+            with (
+                patch.object(marker.subprocess, "run", side_effect=fake_run) as run,
+                patch.object(marker, "qpdf_page_count", return_value=2),
+            ):
+                grouped = marker.create_page_group(
+                    split_pages, [1, 2], root / "groups"
+                )
+
+            self.assertTrue(grouped.is_file())
+            command = run.call_args.args[0]
+            self.assertEqual(command[:3], [str(marker.QPDF), "--empty", "--pages"])
+            self.assertEqual(command[3:7], [
+                str(split_pages[0]), "1", str(split_pages[1]), "1",
+            ])
+
+    def test_grouped_processing_reports_every_page_in_a_failed_group(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source.pdf"
+            source.write_bytes(b"pdf")
+            output = root / "out"
+            output.mkdir()
+            split_pages = [root / f"page-{number}.pdf" for number in range(1, 6)]
+            converted = root / "converted.md"
+            converted.write_text("converted\n", encoding="utf-8")
+            group_inputs = [root / "group-1.pdf", root / "group-2.pdf", root / "group-3.pdf"]
+            progress_events = []
+
+            with (
+                contextlib.redirect_stderr(io.StringIO()),
+                patch.object(marker, "prepare_input_pdf", return_value=source),
+                patch.object(marker, "qpdf_page_count", return_value=5),
+                patch.object(marker, "split_pdf", return_value=split_pages),
+                patch.object(marker, "create_page_group", side_effect=group_inputs),
+                patch.object(
+                    marker, "convert_input", side_effect=[converted, None, converted]
+                ) as convert,
+            ):
+                failed = marker.process_page_by_page(
+                    source, output, "1.10", 30, True, 1, True,
+                    create_metadata=False, pages_per_process=2,
+                    progress_callback=progress_events.append,
+                )
+
+            self.assertEqual(failed, [3, 4])
+            self.assertEqual(convert.call_count, 3)
+            self.assertEqual(
+                [event["event"] for event in progress_events],
+                ["started", "finished"] * 3,
+            )
+            self.assertEqual(
+                [
+                    event["status"]
+                    for event in progress_events
+                    if event["event"] == "finished"
+                ],
+                ["success", "failed", "success"],
+            )
+            self.assertEqual(
+                [event["label"] for event in progress_events[::2]],
+                ["Pages 1–2", "Pages 3–4", "Page 5"],
+            )
+            self.assertTrue(all(
+                event["duration_seconds"] >= 0
+                for event in progress_events
+                if event["event"] == "finished"
+            ))
+            self.assertIn(
+                "Pages 3–4 failed", (output / "source.md").read_text("utf-8")
+            )
+
+    def test_resumed_pages_are_excluded_from_eta_work_units(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source.pdf"
+            source.write_bytes(b"pdf")
+            output = root / "out"
+            output.mkdir()
+            split_pages = [root / f"page-{number}.pdf" for number in range(1, 6)]
+            converted = root / "converted.md"
+            converted.write_text("converted\n", encoding="utf-8")
+            progress_events = []
+            stderr = io.StringIO()
+
+            def checkpoint_for(page_dir, _require_metadata=True):
+                return converted if page_dir.name in {
+                    "page0001", "page0002", "page0003", "page0004"
+                } else None
+
+            marker.REPORTER.configure(progress="plain")
+            with (
+                contextlib.redirect_stderr(stderr),
+                patch.object(marker, "prepare_input_pdf", return_value=source),
+                patch.object(marker, "qpdf_page_count", return_value=5),
+                patch.object(marker, "split_pdf", return_value=split_pages),
+                patch.object(marker, "completed_markdown", side_effect=checkpoint_for),
+                patch.object(marker, "convert_input", return_value=converted),
+            ):
+                failed = marker.process_page_by_page(
+                    source, output, "1.10", 30, True, 1, True,
+                    create_metadata=False,
+                    progress_callback=progress_events.append,
+                )
+
+            started = [
+                event for event in progress_events if event["event"] == "started"
+            ]
+            self.assertEqual(failed, [])
+            self.assertEqual([event["resumed"] for event in started], [
+                True, True, True, True, False,
+            ])
+            self.assertTrue(all(event["timed_total"] == 1 for event in started))
+            self.assertIn("Completed: 5/5 pages (1-5)", stderr.getvalue())
+            self.assertNotIn("[1/5", stderr.getvalue())
+
+    def test_grouped_metadata_keeps_original_page_numbers(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            markdown = root / "group.md"
+            markdown.write_text("group\n", encoding="utf-8")
+            marker.metadata_for(markdown).write_text(json.dumps({
+                "structured_document": {
+                    "pages": [
+                        {"page_id": 0, "blocks": [{"id": "/page/0/Text/0"}]},
+                        {"page_id": 1, "blocks": [{"id": "/page/1/Text/0"}]},
+                    ]
+                }
+            }), encoding="utf-8")
+
+            metadata = marker.build_document_metadata(
+                root / "source.pdf", "2.0", "page", [markdown], {},
+                grouped_page_numbers=[[2, 5]],
+            )
+
+            self.assertEqual([page["page_id"] for page in metadata["pages"]], [1, 4])
+            self.assertEqual(
+                [page["blocks"][0]["id"] for page in metadata["pages"]],
+                ["/page/1/Text/0", "/page/4/Text/0"],
+            )
+
+    def test_qpdf_page_count_can_check_structure_and_accept_warnings(self):
+        result = CompletedProcess(
+            args=[],
+            returncode=3,
+            stdout="checking source.pdf\n2\n",
+            stderr="qpdf: operation succeeded with warnings\n",
+        )
+        with patch.object(marker.subprocess, "run", return_value=result) as run:
+            self.assertEqual(
+                marker.qpdf_page_count(Path("source.pdf"), check_structure=True),
+                2,
+            )
+        self.assertEqual(
+            run.call_args.args[0],
+            [str(marker.QPDF), "--check", "--show-npages", "source.pdf"],
+        )
+
+    def test_qpdf_page_count_rejects_qpdf_errors(self):
+        result = CompletedProcess(
+            args=[], returncode=2, stdout="", stderr="damaged PDF\n"
+        )
+        with (
+            patch.object(marker.subprocess, "run", return_value=result),
+            self.assertRaisesRegex(RuntimeError, "damaged PDF"),
+        ):
+            marker.qpdf_page_count(Path("source.pdf"))
+
+    def test_valid_pdf_uses_qpdf_structural_check(self):
+        with tempfile.TemporaryDirectory() as raw:
+            source = Path(raw) / "source.pdf"
+            source.write_bytes(b"not empty")
+            with patch.object(marker, "qpdf_page_count", return_value=1) as count:
+                self.assertTrue(marker.valid_pdf(source))
+            count.assert_called_once_with(source, check_structure=True)
+
     def test_selected_pages_keep_original_numbers_in_output(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -113,6 +306,7 @@ class MarkerProcessTests(unittest.TestCase):
             with (
                 contextlib.redirect_stderr(io.StringIO()),
                 patch.object(marker, "prepare_input_pdf", return_value=source),
+                patch.object(marker, "qpdf_page_count", return_value=3),
                 patch.object(marker, "split_pdf", return_value=split_pages),
                 patch.object(marker, "convert_input", side_effect=[markdown, None]) as convert,
             ):
@@ -152,16 +346,162 @@ class MarkerProcessTests(unittest.TestCase):
             records = [json.loads(line) for line in stdout.getvalue().splitlines()]
             self.assertEqual(result, 0)
             self.assertEqual([record["type"] for record in records], [
-                "result", "result", "summary"
+                "check", "result", "result", "summary"
             ])
-            self.assertEqual([record["status"] for record in records[:2]], [
+            self.assertEqual([record["status"] for record in records[1:3]], [
                 "success", "success"
             ])
+            self.assertFalse(records[0]["cached"])
             self.assertEqual(records[-1]["succeeded"], 2)
             self.assertTrue(all(
                 call.kwargs["page_selection"] == "1-2"
                 for call in process.call_args_list
             ))
+
+    def test_cached_runtime_components_are_reused_and_reported(self):
+        gpu = {
+            "name": "Test GPU", "memory_total_mib": 4096,
+            "memory_free_mib": 3072,
+        }
+        with (
+            patch.object(marker, "check_qpdf_runtime", return_value=("qpdf ready", None)) as qpdf,
+            patch.object(marker, "check_nvidia_gpu", return_value=("Test GPU", gpu)) as nvidia,
+            patch.object(marker, "check_runtime_file", return_value=("file found", None)) as file_check,
+            patch.object(marker, "check_llama_cuda", return_value=("CUDA ready", None)) as llama,
+            patch.object(
+                marker, "probe_surya_gpu_fit",
+                return_value=(
+                    "30 GPU layers loaded safely",
+                    {"requested": 30, "resolved_gpu_layers": 30, "model_layers": 34},
+                ),
+            ) as fit,
+        ):
+            first = marker.check_runtime("2.0", "page", 30, False)
+            with patch.dict(
+                marker.os.environ,
+                {marker.RUNTIME_CHECK_CACHE_ENV: json.dumps(first["cache"])},
+            ):
+                second = marker.check_runtime("2.0", "whole", 30, False)
+
+        self.assertEqual(first["status"], "ready")
+        self.assertFalse(first["cached"])
+        self.assertEqual(second["status"], "ready")
+        self.assertTrue(second["cached"])
+        self.assertEqual(second["resolved_gpu_layers"], 30)
+        self.assertTrue(all(item["cached"] for item in second["components"]))
+        self.assertEqual(qpdf.call_count, 1)
+        self.assertEqual(nvidia.call_count, 1)
+        self.assertEqual(file_check.call_count, 4)
+        self.assertEqual(llama.call_count, 1)
+        self.assertEqual(fit.call_count, 1)
+
+    def test_gpu_layer_change_rechecks_only_the_model_fit(self):
+        gpu = {
+            "name": "Test GPU", "memory_total_mib": 4096,
+            "memory_free_mib": 3072,
+        }
+        with (
+            patch.object(marker, "check_qpdf_runtime", return_value=("qpdf ready", None)) as qpdf,
+            patch.object(marker, "check_nvidia_gpu", return_value=("Test GPU", gpu)) as nvidia,
+            patch.object(marker, "check_runtime_file", return_value=("file found", None)) as file_check,
+            patch.object(marker, "check_llama_cuda", return_value=("CUDA ready", None)) as llama,
+            patch.object(marker, "probe_surya_gpu_fit") as fit,
+        ):
+            fit.side_effect = [
+                ("30 safe", {"resolved_gpu_layers": 30}),
+                ("20 safe", {"resolved_gpu_layers": 20}),
+            ]
+            first = marker.check_runtime("2.0", "page", 30, False)
+            with patch.dict(
+                marker.os.environ,
+                {marker.RUNTIME_CHECK_CACHE_ENV: json.dumps(first["cache"])},
+            ):
+                second = marker.check_runtime("2.0", "page", 20, False)
+
+        self.assertEqual(second["status"], "ready")
+        self.assertEqual(second["resolved_gpu_layers"], 20)
+        self.assertEqual(qpdf.call_count, 1)
+        self.assertEqual(nvidia.call_count, 1)
+        self.assertEqual(file_check.call_count, 4)
+        self.assertEqual(llama.call_count, 1)
+        self.assertEqual(fit.call_count, 2)
+        fresh = [item["key"] for item in second["components"] if not item["cached"]]
+        self.assertEqual(fresh, ["surya_gpu_fit"])
+
+    def test_engine_switch_reuses_shared_checks_only(self):
+        gpu = {
+            "name": "Test GPU", "memory_total_mib": 4096,
+            "memory_free_mib": 3072,
+        }
+        with (
+            patch.object(marker, "check_qpdf_runtime", return_value=("qpdf ready", None)) as qpdf,
+            patch.object(marker, "check_nvidia_gpu", return_value=("Test GPU", gpu)) as nvidia,
+            patch.object(marker, "check_runtime_file", return_value=("file found", None)),
+            patch.object(marker, "check_llama_cuda", return_value=("CUDA ready", None)),
+            patch.object(marker, "check_marker1_cuda", return_value=("CUDA ready", None)),
+            patch.object(
+                marker, "probe_surya_gpu_fit",
+                return_value=("Auto chose 25", {"resolved_gpu_layers": 25}),
+            ),
+        ):
+            marker2 = marker.check_runtime("2.0", "page", "auto", False)
+            with patch.dict(
+                marker.os.environ,
+                {marker.RUNTIME_CHECK_CACHE_ENV: json.dumps(marker2["cache"])},
+            ):
+                marker1 = marker.check_runtime("1.10", "page", "auto", False)
+
+        self.assertEqual(qpdf.call_count, 1)
+        self.assertEqual(nvidia.call_count, 1)
+        reused = [item["key"] for item in marker1["components"] if item["cached"]]
+        fresh = [item["key"] for item in marker1["components"] if not item["cached"]]
+        self.assertEqual(reused, ["qpdf", "nvidia_gpu"])
+        self.assertEqual(fresh, ["marker_1.10", "marker1_python", "marker1_cuda"])
+
+    def test_gpu_layers_accept_auto_all_or_positive_numbers(self):
+        self.assertEqual(marker.normalize_gpu_layers("Auto"), "auto")
+        self.assertEqual(marker.normalize_gpu_layers("ALL"), "all")
+        self.assertEqual(marker.normalize_gpu_layers("20"), 20)
+        for invalid in ("", "0", "-1", "many"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                marker.normalize_gpu_layers(invalid)
+
+    def test_unsafe_manual_gpu_layers_fail_at_the_model_load_test(self):
+        gpu = {
+            "name": "Test GPU", "memory_total_mib": 4096,
+            "memory_free_mib": 1024,
+        }
+        with (
+            patch.object(marker, "check_qpdf_runtime", return_value=("qpdf ready", None)),
+            patch.object(marker, "check_nvidia_gpu", return_value=("Test GPU", gpu)),
+            patch.object(marker, "check_runtime_file", return_value=("file found", None)),
+            patch.object(marker, "check_llama_cuda", return_value=("CUDA ready", None)),
+            patch.object(
+                marker, "probe_surya_gpu_fit",
+                side_effect=RuntimeError(
+                    "GPU layers 25 could not safely load the Surya model. "
+                    "Choose Auto or a lower number."
+                ),
+            ),
+        ):
+            result = marker.check_runtime("2.0", "page", 25, False)
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["components"][-1]["key"], "surya_gpu_fit")
+        self.assertEqual(result["components"][-1]["status"], "error")
+        self.assertIn("Choose Auto or a lower number", result["error"])
+
+    def test_pages_per_process_requires_page_mode(self):
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            marker.main([
+                "source.pdf", "--mode", "whole", "--pages-per-process", "2"
+            ])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("requires --mode page", stderr.getvalue())
 
     def test_multiple_operands_require_explicit_output(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -197,6 +537,11 @@ class MarkerProcessTests(unittest.TestCase):
         redirected = io.StringIO()
         with contextlib.redirect_stderr(redirected):
             reporter.progress(1, 2, "Page 1", marker.time.monotonic())
+        self.assertEqual(redirected.getvalue(), "")
+
+        reporter.configure(progress="auto", verbose=True)
+        with contextlib.redirect_stderr(redirected):
+            reporter.progress(1, 2, "Page 1", marker.time.monotonic())
         self.assertNotIn("\x1b", redirected.getvalue())
         self.assertTrue(redirected.getvalue().endswith("\n"))
 
@@ -209,6 +554,126 @@ class MarkerProcessTests(unittest.TestCase):
             reporter.progress(1, 2, "Page 1", marker.time.monotonic())
             reporter.finish_progress()
         self.assertIn("\r[1/2", tty.getvalue())
+
+    def test_gui_progress_duration_and_result_formatting(self):
+        self.assertEqual(marker.format_clock_duration(82.8), "00:01:22")
+        self.assertEqual(marker.format_work_duration(38.6), "38.6s")
+        self.assertEqual(marker.format_work_duration(126.7), "2m 06.7s")
+        self.assertEqual(
+            marker.format_page_progress_result("Page 1", True, 38.6),
+            "Page 1 completed — 38.6s ✅",
+        )
+        self.assertEqual(
+            marker.format_page_progress_result("Pages 5–8", False, 126.7),
+            "Pages 5–8 failed — 2m 06.7s ❌",
+        )
+        self.assertFalse(
+            marker.should_show_page_progress_result(True, "standard")
+        )
+        self.assertTrue(
+            marker.should_show_page_progress_result(False, "standard")
+        )
+        self.assertTrue(
+            marker.should_show_page_progress_result(True, "verbose")
+        )
+        self.assertEqual(marker.format_page_ranges([4, 2, 1, 4]), "1-2, 4")
+        self.assertEqual(
+            marker.format_page_summary("Completed", [1, 2, 4], 4),
+            "Completed: 3/4 pages (1-2, 4)",
+        )
+        self.assertEqual(
+            marker.format_page_summary("Failed", [3], 4),
+            "Failed: 1/4 page (3)",
+        )
+
+    def test_eta_uses_only_pages_that_were_actually_processed(self):
+        self.assertEqual(marker.estimate_remaining_seconds(4.0, 1, 2), 4.0)
+        self.assertEqual(marker.estimate_remaining_seconds(4.0, 1, 1), 0.0)
+        self.assertIsNone(marker.estimate_remaining_seconds(0.0, 0, 1))
+        self.assertEqual(marker.estimate_remaining_seconds(0.0, 0, 0), 0.0)
+
+    def test_runtime_check_summary_is_compact_and_keeps_exact_failure(self):
+        summaries = marker.format_runtime_check_summaries({
+            "status": "error",
+            "error": "Surya needs 512 MiB more VRAM",
+            "components": [
+                {"label": "qpdf", "status": "ready", "detail": "qpdf ready"},
+                {
+                    "label": "Graphics card",
+                    "status": "ready",
+                    "detail": "Test GPU",
+                },
+                {
+                    "label": "Surya GPU fit",
+                    "status": "error",
+                    "detail": "Surya needs 512 MiB more VRAM",
+                },
+            ],
+        })
+        self.assertEqual(summaries, [
+            (
+                "ready",
+                "Ready: 2/3",
+            ),
+            (
+                "failed",
+                "Fail: 1/3 check "
+                "(Surya GPU fit — Surya needs 512 MiB more VRAM)",
+            ),
+        ])
+
+    def test_check_command_uses_compact_runtime_summary(self):
+        check = {
+            "status": "error",
+            "error": "CUDA device was not found",
+            "components": [
+                {"label": "qpdf", "status": "ready", "detail": "qpdf ready"},
+                {
+                    "label": "llama.cpp CUDA",
+                    "status": "error",
+                    "detail": "CUDA device was not found",
+                },
+            ],
+            "cache": {"components": {}},
+            "cached": False,
+        }
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            patch.object(marker, "check_runtime", return_value=check),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = marker.main(["--check"])
+
+        self.assertEqual(result, 2)
+        self.assertEqual(stdout.getvalue().splitlines(), [
+            "Ready: 1/2",
+            "Fail: 1/2 check (llama.cpp CUDA — CUDA device was not found)",
+        ])
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_gui_conversion_console_starts_minimized(self):
+        options = marker.gui_child_process_options("conversion")
+        self.assertTrue(
+            options["creationflags"] & marker.subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+        self.assertEqual(
+            options["startupinfo"].wShowWindow,
+            marker.WINDOWS_SHOW_MINIMIZED,
+        )
+        self.assertTrue(
+            options["startupinfo"].dwFlags
+            & marker.subprocess.STARTF_USESHOWWINDOW
+        )
+        self.assertNotIn("startupinfo", marker.gui_child_process_options("check"))
+
+    def test_gui_console_notice_explains_how_to_stop_marker(self):
+        self.assertIn(
+            "Close this terminal window to stop Marker",
+            marker.GUI_CONSOLE_NOTICE,
+        )
+        self.assertIn("checkpoints will be preserved", marker.GUI_CONSOLE_NOTICE)
 
     def test_diagnostic_log_records_details_suppressed_by_quiet(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -770,6 +1235,7 @@ class MarkerProcessTests(unittest.TestCase):
 
             with (
                 patch.object(marker, "prepare_input_pdf", return_value=source),
+                patch.object(marker, "qpdf_page_count", return_value=2),
                 patch.object(marker, "split_pdf", return_value=[source, source]),
                 patch.object(marker, "convert_input", side_effect=[converted, None]),
                 patch.object(marker, "QwenServer") as qwen,
