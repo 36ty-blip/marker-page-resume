@@ -47,15 +47,23 @@ python -m pip install -r requirements.txt
 python -m pip install "marker-pdf==1.10.2"
 ```
 
-Run the controller from the repository:
+Run the first-time setup wizard, review the detected files, and then
+perform the live GPU/model check:
 
 ```powershell
-.\marker.cmd --check
+.\marker.cmd --setup
+.\marker.cmd --doctor --engine marker2
+.\marker.cmd --check --engine marker2
 .\marker.cmd --tutorial
 ```
 
-The default paths target the author's Windows layout. Override runtime paths
-without editing the source:
+The setup wizard saves runtime paths under the current Windows user's Marker
+Controller settings. The GUI exposes the same editor through **Setup paths…**.
+`--doctor` checks that the configured files exist without loading the models;
+`--check` performs the live GPU and model-load test.
+
+Environment variables remain available for temporary or managed overrides and
+take precedence over saved settings:
 
 ```powershell
 $env:MARKER1_EXE = "C:\path\to\marker_single.exe"
