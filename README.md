@@ -47,6 +47,10 @@ python -m pip install -r requirements.txt
 python -m pip install "marker-pdf==1.10.2"
 ```
 
+If the local virtual environment is missing, `marker.cmd` now stops with
+the exact commands needed to create it. Advanced installations may set
+`MARKER_CONTROLLER_PYTHON` to another Python executable.
+
 Run the first-time setup wizard, review the detected files, and then
 perform the live GPU/model check:
 
