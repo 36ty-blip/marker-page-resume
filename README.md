@@ -39,23 +39,35 @@ The controller contains no model files or third-party executables.
 ## Install
 
 ```powershell
-git clone https://github.com/36ty-blip/marker-controller.git
-cd marker-controller
+git clone https://github.com/36ty-blip/marker-page-resume.git
+cd marker-page-resume
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 python -m pip install "marker-pdf==1.10.2"
 ```
 
-Run the controller from the repository:
+If the local virtual environment is missing, `marker.cmd` now stops with
+the exact commands needed to create it. Advanced installations may set
+`MARKER_CONTROLLER_PYTHON` to another Python executable.
+
+Run the first-time setup wizard, review the detected files, and then
+perform the live GPU/model check:
 
 ```powershell
-.\marker.cmd --check
+.\marker.cmd --setup
+.\marker.cmd --doctor --engine marker2
+.\marker.cmd --check --engine marker2
 .\marker.cmd --tutorial
 ```
 
-The default paths target the author's Windows layout. Override runtime paths
-without editing the source:
+The setup wizard saves runtime paths under the current Windows user's Marker
+Controller settings. The GUI exposes the same editor through **Setup paths…**.
+`--doctor` checks that the configured files exist without loading the models;
+`--check` performs the live GPU and model-load test.
+
+Environment variables remain available for temporary or managed overrides and
+take precedence over saved settings:
 
 ```powershell
 $env:MARKER1_EXE = "C:\path\to\marker_single.exe"
