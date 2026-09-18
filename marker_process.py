@@ -88,7 +88,7 @@ def gpu_layers_argument(value: str) -> int | str:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
-CLI_VERSION = "1.8.0"
+CLI_VERSION = "1.9.0"
 RUN_MANIFEST_VERSION = 1
 DOCUMENT_METADATA_SCHEMA_VERSION = 1
 GUI_EVENT_PREFIX = "MARKER_GUI_EVENT "
@@ -237,6 +237,9 @@ def run_setup_wizard() -> int:
         entered = input(f"Path [{suggestion}]: ").strip()
         if entered == "-":
             values.pop(key, None)
+            continue
+        if not entered and not suggestion.is_file():
+            print("Skipped; configure this component later if you need it.")
             continue
         chosen = suggestion if not entered else Path(entered.strip('"')).expanduser()
         if not chosen.is_file():
@@ -3598,6 +3601,8 @@ def build_parser() -> argparse.ArgumentParser:
   marker documents -o converted --engine marker2
   marker documents --recursive --include "*.pdf" --dry-run
   marker --resume
+  marker --setup
+  marker --doctor --engine marker2
   marker --tutorial
   marker document.pdf -o converted --marker1-recognition-batch-size 8 --resume-settings current
   marker --check --engine marker2
