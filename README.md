@@ -39,8 +39,8 @@ The controller contains no model files or third-party executables.
 ## Install
 
 ```powershell
-git clone https://github.com/36ty-blip/marker-controller.git
-cd marker-controller
+git clone https://github.com/36ty-blip/marker-page-resume.git
+cd marker-page-resume
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
