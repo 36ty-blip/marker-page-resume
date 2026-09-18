@@ -4,7 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from subprocess import CompletedProcess
+from subprocess import CompletedProcess, run
 from unittest.mock import MagicMock, patch
 
 from pypdf import PdfWriter
@@ -936,6 +936,33 @@ class MarkerProcessTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertIn("usage: marker", stdout.getvalue())
         self.assertIn("--dry-run", stdout.getvalue())
+
+    def test_windows_launcher_explains_a_missing_local_environment(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            launcher = root / "marker.cmd"
+            source_launcher = Path(marker.__file__).parent / "marker.cmd"
+            launcher.write_text(
+                source_launcher.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            (root / "marker_process.py").write_text("", encoding="utf-8")
+            environment = marker.os.environ.copy()
+            environment.pop("MARKER_CONTROLLER_PYTHON", None)
+            result = run(
+                ["cmd.exe", "/d", "/c", str(launcher), "--version"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=environment,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "could not find its Python environment", result.stdout
+        )
+        self.assertIn("py -3.12 -m venv .venv", result.stdout)
+        self.assertIn("marker.cmd --setup", result.stdout)
 
     def test_gui_runs_the_native_front_end(self):
         with patch.object(marker, "choose_settings", return_value=7) as gui:
