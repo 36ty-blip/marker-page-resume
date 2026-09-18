@@ -21,10 +21,51 @@ from collections import defaultdict
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+APP_CONFIG_FILE = Path(
+    os.environ.get(
+        "MARKER_CONFIG_FILE",
+        Path(os.environ.get("LOCALAPPDATA", SCRIPT_DIR))
+        / "MarkerController"
+        / "config.json",
+    )
+).expanduser()
+
+
+def load_user_config() -> dict[str, str]:
+    try:
+        value = json.loads(APP_CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, TypeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): str(path)
+        for key, path in value.items()
+        if isinstance(key, str) and isinstance(path, str) and path.strip()
+    }
+
+
+USER_CONFIG = load_user_config()
 
 
 def configured_path(name: str, default: str | Path) -> Path:
-    return Path(os.environ.get(name, str(default))).expanduser()
+    return Path(
+        os.environ.get(name, USER_CONFIG.get(name, str(default)))
+    ).expanduser()
+
+
+def save_user_config(values: dict[str, str]) -> None:
+    clean = {
+        str(key): str(path)
+        for key, path in values.items()
+        if isinstance(key, str) and isinstance(path, str) and path.strip()
+    }
+    APP_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    pending = APP_CONFIG_FILE.with_suffix(APP_CONFIG_FILE.suffix + ".tmp")
+    pending.write_text(json.dumps(clean, indent=2), encoding="utf-8")
+    pending.replace(APP_CONFIG_FILE)
+    USER_CONFIG.clear()
+    USER_CONFIG.update(clean)
 
 
 def normalize_gpu_layers(value: object) -> int | str:
@@ -80,6 +121,160 @@ QWEN_MODEL = configured_path(
 QPDF = configured_path("QPDF_EXE", r"C:\Program Files\qpdf 12.3.2\bin\qpdf.exe")
 WEASYPRINT_DLL_DIR = Path(r"C:\msys64\mingw64\bin")
 MARKER2_PYTHON = MARKER_200.parent / "python.exe"
+
+RUNTIME_CONFIGURATION = (
+    ("MARKER1_EXE", "Marker 1 executable"),
+    ("MARKER2_EXE", "Marker 2 executable"),
+    ("QPDF_EXE", "qpdf executable"),
+    ("LLAMA_SERVER", "llama.cpp server"),
+    ("SURYA_MODEL", "Surya model"),
+    ("SURYA_MMPROJ", "Surya projector"),
+    ("QWEN_MODEL", "Qwen model (optional)"),
+)
+
+
+def runtime_configuration_rows() -> list[tuple[str, str, Path]]:
+    paths = {
+        "MARKER1_EXE": MARKER_110,
+        "MARKER2_EXE": MARKER_200,
+        "QPDF_EXE": QPDF,
+        "LLAMA_SERVER": LLAMA_SERVER,
+        "SURYA_MODEL": SURYA_MODEL,
+        "SURYA_MMPROJ": SURYA_MMPROJ,
+        "QWEN_MODEL": QWEN_MODEL,
+    }
+    return [
+        (key, label, paths[key])
+        for key, label in RUNTIME_CONFIGURATION
+    ]
+
+
+def refresh_runtime_paths() -> None:
+    global MARKER_110, MARKER1_PYTHON, MARKER_200, MARKER2_PYTHON
+    global LLAMA_SERVER, SURYA_MODEL, SURYA_MMPROJ, QWEN_MODEL, QPDF
+    MARKER_110 = configured_path(
+        "MARKER1_EXE", SCRIPT_DIR / ".venv" / "Scripts" / "marker_single.exe"
+    )
+    MARKER1_PYTHON = MARKER_110.parent / "python.exe"
+    MARKER_200 = configured_path(
+        "MARKER2_EXE",
+        SCRIPT_DIR.parent / "marker2" / ".venv" / "Scripts" / "marker_single.exe",
+    )
+    MARKER2_PYTHON = MARKER_200.parent / "python.exe"
+    LLAMA_SERVER = configured_path(
+        "LLAMA_SERVER",
+        SCRIPT_DIR.parent / "marker2" / "llama.cpp" / "llama-server.exe",
+    )
+    SURYA_MODEL = configured_path(
+        "SURYA_MODEL", SCRIPT_DIR.parent / "marker2" / "models" / "surya-2.gguf"
+    )
+    SURYA_MMPROJ = configured_path(
+        "SURYA_MMPROJ",
+        SCRIPT_DIR.parent / "marker2" / "models" / "surya-2-mmproj.gguf",
+    )
+    QWEN_MODEL = configured_path(
+        "QWEN_MODEL", r"C:\AI\models\Qwen3.5-4B\Qwen3.5-4B-Q4_K_M.gguf"
+    )
+    QPDF = configured_path(
+        "QPDF_EXE", r"C:\Program Files\qpdf 12.3.2\bin\qpdf.exe"
+    )
+
+
+def detected_runtime_path(key: str, current: Path) -> Path:
+    candidates = [current]
+    executable = {
+        "QPDF_EXE": "qpdf",
+        "LLAMA_SERVER": "llama-server",
+    }.get(key)
+    if executable:
+        found = shutil.which(executable)
+        if found:
+            candidates.append(Path(found))
+    if key == "QPDF_EXE":
+        program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        try:
+            candidates.extend(
+                sorted(program_files.glob("qpdf*/bin/qpdf.exe"), reverse=True)
+            )
+        except OSError:
+            pass
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate.resolve()
+        except OSError:
+            continue
+    return current
+
+
+def save_runtime_configuration(values: dict[str, str]) -> None:
+    saved = dict(USER_CONFIG)
+    for key, _label in RUNTIME_CONFIGURATION:
+        value = values.get(key, "").strip().strip('"')
+        if value:
+            saved[key] = str(Path(value).expanduser().resolve())
+        else:
+            saved.pop(key, None)
+    save_user_config(saved)
+    refresh_runtime_paths()
+
+
+def run_setup_wizard() -> int:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print(
+            "Marker setup requires an interactive terminal. "
+            "Run 'marker --setup' directly in PowerShell, or use Setup paths in the GUI.",
+            file=sys.stderr,
+        )
+        return 2
+    print("Marker runtime setup")
+    print("Press Enter to keep each suggested path, or type - to clear its saved value.")
+    values = dict(USER_CONFIG)
+    for key, label, current in runtime_configuration_rows():
+        suggestion = detected_runtime_path(key, current)
+        status = "found" if suggestion.is_file() else "not found"
+        print(f"\n{label} ({status})")
+        entered = input(f"Path [{suggestion}]: ").strip()
+        if entered == "-":
+            values.pop(key, None)
+            continue
+        chosen = suggestion if not entered else Path(entered.strip('"')).expanduser()
+        if not chosen.is_file():
+            keep = input("That file was not found. Save this path anyway? [y/N]: ")
+            if keep.strip().casefold() not in {"y", "yes"}:
+                continue
+        values[key] = str(chosen.resolve())
+    save_runtime_configuration(values)
+    print(f"\nSaved runtime paths to {APP_CONFIG_FILE}")
+    print("Run 'marker --doctor --engine marker2' to review the installation.")
+    return 0
+
+
+def run_path_doctor(marker_version: str, llm_refinement: bool = False) -> int:
+    print(f"Marker Controller doctor — Marker {marker_version}")
+    print(f"Configuration: {APP_CONFIG_FILE}")
+    missing = []
+    for label, path in required_runtime_files(
+        marker_version, "page", llm_refinement
+    ):
+        exists = path.is_file()
+        print(f"{'OK' if exists else 'MISSING'}  {label}: {path}")
+        if not exists:
+            missing.append((label, path))
+    if missing:
+        print(
+            f"\n{len(missing)} required component(s) are missing. "
+            "Run 'marker --setup' to configure their paths."
+        )
+        return 2
+    print("\nAll configured files were found.")
+    print(
+        "Run 'marker --check --engine "
+        + ("marker1" if marker_version == "1.10" else "marker2")
+        + "' for the live GPU and model-load test."
+    )
+    return 0
+
 OFFICE_CONVERTER = SCRIPT_DIR / "office_to_pdf.ps1"
 # LibreOffice 26.8 documents headless CLI work through soffice.com on Windows.
 LIBREOFFICE = Path(r"C:\Program Files\LibreOffice\program\soffice.com")
@@ -1350,6 +1545,23 @@ def choose_settings() -> int:
             ).start()
 
     def start() -> None:
+        if restart_var.get():
+            selected = [
+                Path(value).name for value in input_list.get(0, tk.END)
+            ]
+            preview = "\n".join(f"• {name}" for name in selected[:8])
+            if len(selected) > 8:
+                preview += f"\n• …and {len(selected) - 8} more"
+            if not messagebox.askyesno(
+                "Restart and delete previous work?",
+                "Restart removes existing checkpoints, generated Markdown, "
+                "refined output, and matching extracted images for the selected "
+                "documents. This cannot be undone.\n\n"
+                f"{preview}\n\nContinue?",
+                parent=root,
+                icon="warning",
+            ):
+                return
         launch("conversion")
 
     def preview() -> None:
@@ -1367,6 +1579,87 @@ def choose_settings() -> int:
         threading.Thread(
             target=stop_process_tree, args=(process, True), daemon=True
         ).start()
+
+    def open_runtime_setup() -> None:
+        window = tk.Toplevel(root)
+        window.title("Runtime paths")
+        window.geometry("820x410")
+        window.transient(root)
+        window.columnconfigure(1, weight=1)
+        ttk.Label(
+            window,
+            text=(
+                "Configure the local executables and models used by Marker. "
+                "Environment variables override saved paths."
+            ),
+            padding=10,
+            wraplength=780,
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        variables = {}
+        rows = runtime_configuration_rows()
+        for row, (key, label, path) in enumerate(rows, start=1):
+            variable = tk.StringVar(value=str(path))
+            variables[key] = variable
+            ttk.Label(window, text=label).grid(
+                row=row, column=0, sticky="w", padx=(10, 8), pady=4
+            )
+            ttk.Entry(window, textvariable=variable).grid(
+                row=row, column=1, sticky="ew", pady=4
+            )
+
+            def browse(target=variable, title=label):
+                chosen = filedialog.askopenfilename(parent=window, title=title)
+                if chosen:
+                    target.set(chosen)
+
+            ttk.Button(window, text="Browse…", command=browse).grid(
+                row=row, column=2, sticky="ew", padx=10, pady=4
+            )
+
+        status = tk.StringVar(value=f"Settings file: {APP_CONFIG_FILE}")
+        ttk.Label(window, textvariable=status).grid(
+            row=len(rows) + 1, column=0, columnspan=3,
+            sticky="w", padx=10, pady=(8, 4),
+        )
+
+        def auto_detect() -> None:
+            found = 0
+            for key, _label, current in runtime_configuration_rows():
+                candidate = detected_runtime_path(key, current)
+                variables[key].set(str(candidate))
+                found += int(candidate.is_file())
+            status.set(f"Auto-detection found {found}/{len(rows)} files.")
+
+        def save_paths() -> None:
+            try:
+                save_runtime_configuration({
+                    key: variable.get() for key, variable in variables.items()
+                })
+            except OSError as exc:
+                messagebox.showerror(
+                    "Cannot save runtime paths", str(exc), parent=window
+                )
+                return
+            state["runtime_cache"] = {"components": {}}
+            state["checked_signature"] = None
+            status_var.set(
+                "Runtime paths saved. Checking the selected engine…"
+            )
+            window.destroy()
+            schedule_runtime_check()
+
+        actions = ttk.Frame(window, padding=10)
+        actions.grid(row=len(rows) + 2, column=0, columnspan=3, sticky="e")
+        ttk.Button(actions, text="Auto-detect", command=auto_detect).grid(
+            row=0, column=0
+        )
+        ttk.Button(actions, text="Cancel", command=window.destroy).grid(
+            row=0, column=1, padx=(8, 0)
+        )
+        ttk.Button(actions, text="Save paths", command=save_paths).grid(
+            row=0, column=2, padx=(8, 0)
+        )
+        window.grab_set()
 
     def close() -> None:
         process = state["process"]
@@ -1564,16 +1857,19 @@ def choose_settings() -> int:
 
     buttons = ttk.Frame(frame)
     buttons.grid(row=17, column=0, columnspan=3, sticky="e", pady=(8, 0))
+    ttk.Button(buttons, text="Setup paths…", command=open_runtime_setup).grid(
+        row=0, column=0
+    )
     check_button = ttk.Button(buttons, text="Check runtime", command=check)
-    check_button.grid(row=0, column=0)
+    check_button.grid(row=0, column=1, padx=(8, 0))
     preview_button = ttk.Button(buttons, text="Preview", command=preview)
-    preview_button.grid(row=0, column=1, padx=(8, 0))
+    preview_button.grid(row=0, column=2, padx=(8, 0))
     stop_button = ttk.Button(buttons, text="Stop safely", command=stop, state="disabled")
-    stop_button.grid(row=0, column=2, padx=(8, 0))
+    stop_button.grid(row=0, column=3, padx=(8, 0))
     start_button = ttk.Button(buttons, text="Start conversion", command=start)
-    start_button.grid(row=0, column=3, padx=(8, 0))
+    start_button.grid(row=0, column=4, padx=(8, 0))
     ttk.Button(buttons, text="Close", command=close).grid(
-        row=0, column=4, padx=(8, 0)
+        row=0, column=5, padx=(8, 0)
     )
 
     marker_var.trace_add("write", runtime_settings_changed)
@@ -3443,6 +3739,14 @@ and MARKER_GUI_PYTHON.
         help="validate the selected engine and GPU without converting",
     )
     exclusive_operation.add_argument(
+        "--doctor", action="store_true",
+        help="show configured runtime files and identify missing components",
+    )
+    exclusive_operation.add_argument(
+        "--setup", action="store_true",
+        help="open the interactive runtime-path setup wizard",
+    )
+    exclusive_operation.add_argument(
         "--gui", action="store_true", help="open the graphical launcher"
     )
     exclusive_operation.add_argument(
@@ -4576,6 +4880,15 @@ def main(argv: list[str] | None = None) -> int:
         "2.0": "marker2",
     }.get(args.legacy_marker_version, "marker2")
     marker_version = {"marker1": "1.10", "marker2": "2.0"}[engine]
+
+    if args.setup:
+        if args.source or args.legacy_input or args.output:
+            parser.error("--setup does not accept input or output paths")
+        return run_setup_wizard()
+    if args.doctor:
+        if args.source or args.legacy_input or args.output:
+            parser.error("--doctor does not accept input or output paths")
+        return run_path_doctor(marker_version, args.llm_refinement)
 
     if marker_version == "1.10" and args.gpu_layers is not None:
         parser.error("--gpu-layers only applies to Marker 2")
