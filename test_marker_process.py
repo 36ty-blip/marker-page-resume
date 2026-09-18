@@ -89,6 +89,56 @@ class MarkerProcessTests(unittest.TestCase):
         self.assertIn("Quick start", stdout.getvalue())
         self.assertIn("marker --resume", stdout.getvalue())
 
+    def test_doctor_reports_missing_runtime_files_without_loading_models(self):
+        missing = Path(self._resume_directory.name) / "missing.exe"
+        stdout = io.StringIO()
+        with (
+            contextlib.redirect_stdout(stdout),
+            patch.object(
+                marker, "required_runtime_files",
+                return_value=[("Test component", missing)],
+            ),
+            patch.object(marker, "check_runtime") as live_check,
+        ):
+            result = marker.main(["--doctor", "--engine", "marker2"])
+        self.assertEqual(result, 2)
+        self.assertIn("MISSING  Test component", stdout.getvalue())
+        self.assertIn("marker --setup", stdout.getvalue())
+        live_check.assert_not_called()
+
+    def test_doctor_accepts_a_complete_path_configuration(self):
+        present = Path(self._resume_directory.name) / "component.exe"
+        present.touch()
+        stdout = io.StringIO()
+        with (
+            contextlib.redirect_stdout(stdout),
+            patch.object(
+                marker, "required_runtime_files",
+                return_value=[("Test component", present)],
+            ),
+        ):
+            result = marker.main(["--doctor", "--engine", "marker1"])
+        self.assertEqual(result, 0)
+        self.assertIn("OK  Test component", stdout.getvalue())
+        self.assertIn("marker --check --engine marker1", stdout.getvalue())
+
+    def test_user_configuration_is_saved_atomically(self):
+        config_file = Path(self._resume_directory.name) / "config.json"
+        previous = dict(marker.USER_CONFIG)
+
+        def restore():
+            marker.USER_CONFIG.clear()
+            marker.USER_CONFIG.update(previous)
+
+        self.addCleanup(restore)
+        with patch.object(marker, "APP_CONFIG_FILE", config_file):
+            marker.save_user_config({"QPDF_EXE": "C:/tools/qpdf.exe"})
+        self.assertEqual(
+            json.loads(config_file.read_text(encoding="utf-8")),
+            {"QPDF_EXE": "C:/tools/qpdf.exe"},
+        )
+        self.assertEqual(marker.USER_CONFIG["QPDF_EXE"], "C:/tools/qpdf.exe")
+
     def test_page_selection_supports_ranges_open_ends_and_deduplication(self):
         self.assertEqual(
             marker.parse_page_selection("1-3,3,5,8-", 10),
