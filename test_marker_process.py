@@ -4,7 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from subprocess import CompletedProcess
+from subprocess import CompletedProcess, run
 from unittest.mock import MagicMock, patch
 
 from pypdf import PdfWriter
@@ -88,6 +88,56 @@ class MarkerProcessTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertIn("Quick start", stdout.getvalue())
         self.assertIn("marker --resume", stdout.getvalue())
+
+    def test_doctor_reports_missing_runtime_files_without_loading_models(self):
+        missing = Path(self._resume_directory.name) / "missing.exe"
+        stdout = io.StringIO()
+        with (
+            contextlib.redirect_stdout(stdout),
+            patch.object(
+                marker, "required_runtime_files",
+                return_value=[("Test component", missing)],
+            ),
+            patch.object(marker, "check_runtime") as live_check,
+        ):
+            result = marker.main(["--doctor", "--engine", "marker2"])
+        self.assertEqual(result, 2)
+        self.assertIn("MISSING  Test component", stdout.getvalue())
+        self.assertIn("marker --setup", stdout.getvalue())
+        live_check.assert_not_called()
+
+    def test_doctor_accepts_a_complete_path_configuration(self):
+        present = Path(self._resume_directory.name) / "component.exe"
+        present.touch()
+        stdout = io.StringIO()
+        with (
+            contextlib.redirect_stdout(stdout),
+            patch.object(
+                marker, "required_runtime_files",
+                return_value=[("Test component", present)],
+            ),
+        ):
+            result = marker.main(["--doctor", "--engine", "marker1"])
+        self.assertEqual(result, 0)
+        self.assertIn("OK  Test component", stdout.getvalue())
+        self.assertIn("marker --check --engine marker1", stdout.getvalue())
+
+    def test_user_configuration_is_saved_atomically(self):
+        config_file = Path(self._resume_directory.name) / "config.json"
+        previous = dict(marker.USER_CONFIG)
+
+        def restore():
+            marker.USER_CONFIG.clear()
+            marker.USER_CONFIG.update(previous)
+
+        self.addCleanup(restore)
+        with patch.object(marker, "APP_CONFIG_FILE", config_file):
+            marker.save_user_config({"QPDF_EXE": "C:/tools/qpdf.exe"})
+        self.assertEqual(
+            json.loads(config_file.read_text(encoding="utf-8")),
+            {"QPDF_EXE": "C:/tools/qpdf.exe"},
+        )
+        self.assertEqual(marker.USER_CONFIG["QPDF_EXE"], "C:/tools/qpdf.exe")
 
     def test_page_selection_supports_ranges_open_ends_and_deduplication(self):
         self.assertEqual(
@@ -886,6 +936,33 @@ class MarkerProcessTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertIn("usage: marker", stdout.getvalue())
         self.assertIn("--dry-run", stdout.getvalue())
+
+    def test_windows_launcher_explains_a_missing_local_environment(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            launcher = root / "marker.cmd"
+            source_launcher = Path(marker.__file__).parent / "marker.cmd"
+            launcher.write_text(
+                source_launcher.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            (root / "marker_process.py").write_text("", encoding="utf-8")
+            environment = marker.os.environ.copy()
+            environment.pop("MARKER_CONTROLLER_PYTHON", None)
+            result = run(
+                ["cmd.exe", "/d", "/c", str(launcher), "--version"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=environment,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "could not find its Python environment", result.stdout
+        )
+        self.assertIn("py -3.12 -m venv .venv", result.stdout)
+        self.assertIn("marker.cmd --setup", result.stdout)
 
     def test_gui_runs_the_native_front_end(self):
         with patch.object(marker, "choose_settings", return_value=7) as gui:
